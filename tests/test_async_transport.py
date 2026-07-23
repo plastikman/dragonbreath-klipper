@@ -38,6 +38,7 @@ class _MockDevice:
                             "fault": False, "fault_reason": None}
         self.target_delay = 0.0     # seconds the /target handler sleeps
         self.target_fail_times = 0  # next N /target POSTs answer 500
+        self.reflect_target = True  # if True, an accepted /target updates status
         self._requests = []         # (method, path)
         self._lock = threading.Lock()
 
@@ -80,9 +81,19 @@ def _make_handler(dev):
             if self.path.startswith("/target"):
                 if dev.target_delay:
                     time.sleep(dev.target_delay)
+                # A rejected write must NOT change device state (as a real device):
+                # decide failure before applying the target.
                 if dev.next_target_fails():
                     self.send_error(500)
                     return
+                if dev.reflect_target:
+                    try:
+                        t = float(self.path.split("t=", 1)[1])
+                        with dev._lock:
+                            dev.status_body["target"] = t
+                            dev.status_body["heating"] = t > 0
+                    except (IndexError, ValueError):
+                        pass
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -175,6 +186,37 @@ class AsyncTransportTest(unittest.TestCase):
         self.assertTrue(
             _wait_until(lambda: "/target?t=0" in self.dev.paths("POST"), timeout=3.0),
             "stop() did not deliver a final OFF")
+
+    def test_off_asserted_when_device_reports_external_heating(self):
+        # Regression (safety): desired target is 0, but the device reports it is
+        # heating at 60 (external/uncommanded — e.g. reboot drift, physical button,
+        # or a stuck device that ignores our OFF). The worker MUST POST target 0,
+        # reconciling against the device's reported state, not just its own last
+        # write. Previously this sent nothing (0 == last_sent 0) and the heater
+        # could stay on until the device's 5-minute watchdog.
+        self.dev.status_body["target"] = 60.0
+        self.dev.status_body["heating"] = True
+        self.dev.reflect_target = False   # device stays "hot" despite our OFF
+        t = self._transport()             # desired target defaults to 0
+        t.start()
+        self.assertTrue(
+            _wait_until(lambda: "/target?t=0" in self.dev.paths("POST"), timeout=6.0),
+            "worker never asserted OFF against externally-reported heating")
+
+    def test_force_off_posts_even_when_already_believed_off(self):
+        # force_off() must unconditionally result in an OFF POST, even if the
+        # transport already thinks the target is 0.
+        t = self._transport()
+        t.start()
+        # Let it settle at 0 (initial reconcile posts once).
+        self.assertTrue(_wait_until(lambda: t._last_sent_target == 0.0, timeout=5.0))
+        n_before = len([p for p in self.dev.paths("POST") if p == "/target?t=0"])
+        t.force_off()
+        self.assertTrue(
+            _wait_until(
+                lambda: len([p for p in self.dev.paths("POST") if p == "/target?t=0"])
+                > n_before, timeout=5.0),
+            "force_off did not produce a fresh OFF POST")
 
     def test_reset_is_enqueued_not_blocking(self):
         self.dev.target_delay = 0.0

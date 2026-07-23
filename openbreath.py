@@ -98,9 +98,13 @@ class _OpenBreathHTTP:
         # Desired target: written by the reactor thread, read by the worker.
         # A float load/store is atomic under the GIL, so no lock is needed.
         self._desired_target = 0.
-        # Last target the device accepted (2xx) — worker-owned. When it differs
-        # from the desired target the worker keeps (re)sending until it matches.
-        self._last_sent_target = 0.
+        # Last target the device accepted (2xx) — worker-owned. None means the
+        # device's state is unknown (startup, or after a force-off), which forces
+        # the next reconcile to assert the desired target unconditionally. When it
+        # differs from the desired target the worker keeps (re)sending until it
+        # matches. Reconciliation also checks the device's *reported* target, so a
+        # target we never sent (reboot drift, physical button, WebUI) is corrected.
+        self._last_sent_target = None
         # One-shot commands (e.g. fault reset). deque append/popleft are atomic.
         self._cmd_queue = collections.deque()
         # Set by the reactor on any change so the worker acts at once rather than
@@ -128,25 +132,32 @@ class _OpenBreathHTTP:
             wrote_ok = True
             try:
                 self._drain_commands()
-                wrote_ok = self._sync_target()
+                # Poll status FIRST so target reconciliation sees the device's
+                # actually-reported state (target/heating), not a stale guess —
+                # this is what lets us correct uncommanded/external heating.
                 st = self._get_status()
                 if st is not None:
                     self._on_message(st)
-                    if self._desired_target > 0.:
-                        self._post("/heartbeat", quiet=True)  # feed device watchdog
+                    dev_target = st.get("target")
+                    dev_heating = bool(st.get("heating"))
                 else:
                     self._on_disconnect()
+                    dev_target, dev_heating = None, False
                     wrote_ok = False
+                # Reconcile the device to the desired target (may POST an OFF even
+                # when we believe we already sent one — see _sync_target).
+                if not self._sync_target(dev_target, dev_heating):
+                    wrote_ok = False
+                # Feed the device comms watchdog only while we want heat.
+                if self._desired_target > 0.:
+                    self._post("/heartbeat", quiet=True)
             except Exception as exc:
                 logger.debug("openbreath: worker cycle error: %s", exc)
                 self._on_disconnect()
                 wrote_ok = False
-            # Steady poll when in sync; exponential backoff while a write is
-            # outstanding and failing, so a downed device doesn't get hammered.
-            if wrote_ok or self._desired_target == self._last_sent_target:
-                fail_shift = 0
-            else:
-                fail_shift = min(fail_shift + 1, WRITE_BACKOFF_MAX_SHIFT)
+            # Steady poll when in sync; exponential backoff while a needed write
+            # is failing, so a downed device doesn't get hammered.
+            fail_shift = 0 if wrote_ok else min(fail_shift + 1, WRITE_BACKOFF_MAX_SHIFT)
             delay = self._poll * (1 << fail_shift)
             if self._wake.wait(timeout=delay):
                 self._wake.clear()
@@ -162,7 +173,12 @@ class _OpenBreathHTTP:
         self._wake.set()
 
     def force_off(self):
-        self.set_target(0.)
+        # Unconditionally (re)assert OFF: clearing the confirmed-state cache makes
+        # the next reconcile POST /target?t=0 even if we believe the device is
+        # already at 0. Guarantees connect/disconnect/shutdown force-offs are sent.
+        self._desired_target = 0.
+        self._last_sent_target = None
+        self._wake.set()
 
     def reset_fault(self):
         self._cmd_queue.append("reset")
@@ -178,18 +194,32 @@ class _OpenBreathHTTP:
             if cmd == "reset":
                 self._post("/reset")
 
-    def _sync_target(self):
-        """Push the desired target to the device if it isn't there yet.
+    def _sync_target(self, dev_target, dev_heating):
+        """Reconcile the device to the desired target, POSTing /target when needed.
 
-        Returns True when the device target matches the desired target (already
-        synced or just accepted), False if a needed write failed (retry next
-        cycle). A target write also counts as liveness on the device side.
+        Crucially this checks the device's REPORTED state, not just our own last
+        write, so it corrects heating we never commanded — initial force-off,
+        uncommanded heating, device reboot drift, and physical-button / WebUI
+        changes all show up as a device target/heating that disagrees with what we
+        want, and get driven back. A target write also counts as device liveness.
+
+        Returns True if in sync or the write succeeded, False if a needed write
+        failed (so the caller backs off and retries).
         """
-        dt = self._desired_target
-        if dt == self._last_sent_target:
+        desired = self._desired_target
+        need = False
+        if self._last_sent_target is None:
+            need = True                                    # unknown -> assert desired
+        elif dev_target is not None and abs(dev_target - desired) > 0.01:
+            need = True                                    # device diverged from desired
+        elif dev_heating and desired <= 0.:
+            need = True                                    # device hot but we want off
+        elif desired != self._last_sent_target:
+            need = True                                    # desired changed since last send
+        if not need:
             return True
-        if self._post("/target?t=%g" % dt):
-            self._last_sent_target = dt
+        if self._post("/target?t=%g" % desired):
+            self._last_sent_target = desired
             return True
         return False
 
