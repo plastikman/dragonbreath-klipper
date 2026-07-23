@@ -15,23 +15,29 @@ It talks to DragonBreath's HTTP control API over your LAN (no MQTT broker, no cl
 ## How it works
 - Registers a `sensor_type: dragonbreath` + a `heater_pin: dragonbreath:pwm` virtual
   pin, so a normal `[heater_generic]` renders as a chamber heater card in Fluidd.
-- **All network I/O runs on a single background worker thread** — Klipper's
-  reactor never blocks on the device. Setting the heater target
-  (M141 / `SET_HEATER_TEMPERATURE` / the Fluidd card) just hands the *desired*
-  target to the worker and returns immediately; the worker POSTs `/target?t=<C>`,
-  retrying with backoff until the device accepts it. (This is deliberate: a
-  synchronous HTTP write on the reactor could stall it long enough to trip
-  "Timer Too Close" and shut the MCU down mid-print.)
-- The worker also polls `GET /status` and feeds the temperature into the heater's
-  sensor callback (on the MCU clock, so `verify_heater` works). Both the
-  Klipper-desired target and the device-reported target are exposed on the
-  `dragonbreath` object (`target` vs `device_target`) so divergence is visible.
-- While a target is set, the worker `POST /heartbeat`s every poll. If Klipper
-  crashes/hangs the heartbeats stop and DragonBreath's own comms watchdog latches
-  the heater off — **that watchdog, not the OFF request, is the real fail-safe.**
-  On Klipper disconnect/shutdown the module commands the device off (delivered by
-  the worker) and force-offs any *uncommanded* device heating.
+- **All network I/O runs on background threads** — Klipper's reactor never
+  blocks on the device. Setting the heater target (M141 /
+  `SET_HEATER_TEMPERATURE` / the Fluidd card) records one explicit intent and
+  returns immediately. The command worker sends a revision-aware API v2 command;
+  retries reuse the same request ID.
+- The helper consumes `GET /api/v2/events` (SSE) and uses serialized
+  `GET /api/v2/state` polling only as a reconnect fallback. Complete device
+  snapshots feed the heater sensor callback on the MCU clock, so
+  `verify_heater` still works.
+- An accepted POWER_ON returns a device-issued lease privately in that
+  authenticated command response. Public state/events expose only lease
+  ownership and expiry metadata. The helper heartbeats only its exact private
+  lease. If a button, WebUI, safety transition, or another controller supersedes
+  it, DragonBreath invalidates the lease and the helper accepts that authoritative
+  state instead of silently restoring its old target.
+- If Klipper crashes/hangs, lease heartbeats stop and DragonBreath's own watchdog
+  latches the heater off — **that watchdog, not the OFF request, is the real
+  fail-safe.** On orderly disconnect/shutdown the worker also sends an
+  unconditional API v2 OFF.
 - Every mutating request carries the `X-DragonBreath-Auth` header.
+
+This helper requires DragonBreath firmware API v2. It does not probe or fall
+back to the removed alpha `/status`, `/target`, `/heartbeat`, or `/reset` routes.
 
 ## Install
 ```bash
@@ -50,7 +56,7 @@ host: 10.168.2.53          # DragonBreath device IP or hostname (dragonbreath.lo
 #port: 80
 #token: web                # X-DragonBreath-Auth value. Leave as "web" unless you set
                            # a control token on the device (NVS ctl_token); then match it.
-#poll_interval: 2.0        # seconds between /status polls
+#poll_interval: 2.0        # API v2 polling fallback / retry base interval
 #register_macros: True     # register M141/M191 (set False if you define your own)
 
 [heater_generic dragonbreath]
@@ -77,8 +83,11 @@ The `[dragonbreath]` name and the `[heater_generic dragonbreath]` name must matc
   - `SET_HEATER_TEMPERATURE HEATER=dragonbreath TARGET=45`
   - `DRAGONBREATH_RESET` — clear a latched device fault (over-temp / sensor / comms)
 
-Extra status is exposed on the `dragonbreath` printer object for macros/dashboards:
-`heating`, `fault`, `fault_reason`, `ptc_temp`, `connected`.
+Extra authoritative status is exposed on the `dragonbreath` printer object for
+macros/dashboards: `heating`, `fault`, `inhibited`, `fault_reason`, `ptc_temp`,
+`connected`, `mode`, `source`, `state_revision`, `firmware_version`,
+`lease_owner`, `lease_owned`, `heater_demand`, `fan_percent`, `fan_reason`,
+`device_moonraker_connected`, and `protocol_error`.
 
 ## Moonraker update manager
 ```ini

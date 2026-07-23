@@ -5,11 +5,9 @@
 # heater with a live temperature and a settable target, and can be driven with
 # M141 / M191.
 #
-# It talks to the DragonBreath HTTP control API (see the DragonBreath firmware):
-#   GET  /status        -> {temp,target,heating,fault,fault_reason,...}
-#   POST /target?t=<C>  -> set chamber setpoint (0 = off); counts as liveness
-#   POST /heartbeat     -> controller liveness (feeds the device comms watchdog)
-#   POST /reset         -> clear a latched device fault
+# It talks only to DragonBreath API v2:
+#   GET  /api/v2/info, /api/v2/state, /api/v2/events
+#   POST /api/v2/command, /api/v2/heartbeat
 # Every mutating call carries the X-DragonBreath-Auth header (CSRF gate / token).
 #
 # This is a focused fork of Justin Hayes' pandabreath-klipper: it keeps the
@@ -26,7 +24,7 @@
 #   #port: 80
 #   #token: web              # X-DragonBreath-Auth value; set this if you configured
 #                            # a control token on the device (NVS ctl_token)
-#   #poll_interval: 2.0
+#   #poll_interval: 2.0        # API v2 polling fallback / retry base interval
 #
 #   [heater_generic dragonbreath]
 #   heater_pin: dragonbreath:pwm
@@ -50,6 +48,7 @@ import time
 import urllib.request
 import urllib.error
 import collections
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -64,27 +63,21 @@ TEMP_STALE_WARN = 30.
 HTTP_SLOW_WARN_MS = 1000.
 # Cap the exponential write-retry backoff at poll * 2**this.
 WRITE_BACKOFF_MAX_SHIFT = 3
+API_VERSION = 2
+HEARTBEAT_INTERVAL = 30.
 
 
 # ─── DragonBreath HTTP transport ────────────────────────────────────────────────
 
 class _DragonBreathHTTP:
-    """Background HTTP client for the DragonBreath control API.
+    """Asynchronous DragonBreath API v2 controller and state observer.
 
-    A single daemon worker thread is the SOLE owner of every HTTP call — status
-    polls, heartbeats, target writes, and fault resets. The reactor thread never
-    touches the network: it only assigns the desired target (an atomic float
-    write) or enqueues a one-shot command, and pokes a wake Event. This is what
-    keeps Klipper's reactor from blocking on a slow request and tripping "Timer
-    Too Close" mid-print.
-
-    Each cycle the worker: drains queued commands, syncs the device target to the
-    desired target (retrying with backoff until the device accepts it — this is
-    the async, self-healing OFF path), polls GET /status, and — while a positive
-    target is commanded — POSTs /heartbeat so the device's comms watchdog stays
-    fed only as long as Klipper is alive. If Klippy crashes/hangs the heartbeats
-    stop and the device latches the heater off; that watchdog, not the OFF POST,
-    is the real fail-safe. Mutating calls carry the X-DragonBreath-Auth header.
+    The Klipper reactor only records intent and drains state callbacks. A command
+    worker owns all command/heartbeat/poll requests; a second daemon consumes the
+    device's SSE stream. The full device snapshot is authoritative. Exactly one
+    accepted POWER_ON command yields exactly one lease, and only that lease is
+    heartbeated. If a button, dashboard, safety transition, or another controller
+    supersedes it, the helper drops ownership and does not silently re-arm.
     """
 
     def __init__(self, host, port, token, on_message, on_disconnect, poll):
@@ -95,186 +88,418 @@ class _DragonBreathHTTP:
         self._poll = poll
         self._running = False
         self._thread = None
-        # Desired target: written by the reactor thread, read by the worker.
-        # A float load/store is atomic under the GIL, so no lock is needed.
+        self._event_thread = None
+        self._event_response = None
+        self._event_live = False
+        self._state_lock = threading.Lock()
+        self._latest_state = None
+        self._lease_id = None
+        self._actor_id = "klippy-" + uuid.uuid4().hex[:12]
         self._desired_target = 0.
-        # Last target the device accepted (2xx) — worker-owned. None means the
-        # device's state is unknown (startup, or after a force-off), which forces
-        # the next reconcile to assert the desired target unconditionally. When it
-        # differs from the desired target the worker keeps (re)sending until it
-        # matches. Reconciliation also checks the device's *reported* target, so a
-        # target we never sent (reboot drift, physical button, WebUI) is corrected.
-        self._last_sent_target = None
-        # One-shot commands (e.g. fault reset). deque append/popleft are atomic.
+        self._intent_seq = 0
+        self._applied_seq = -1
+        self._pending = None
+        self._applied_target = None
         self._cmd_queue = collections.deque()
-        # Set by the reactor on any change so the worker acts at once rather than
-        # waiting out a full poll interval.
         self._wake = threading.Event()
+        self._last_protocol_error = None
 
     # -- lifecycle --
     def start(self):
+        if self._running:
+            return
         self._running = True
+        self._event_thread = threading.Thread(
+            target=self._event_run, name="dragonbreath_events", daemon=True)
         self._thread = threading.Thread(
             target=self._run, name="dragonbreath_http", daemon=True)
+        self._event_thread.start()
         self._thread.start()
 
     def stop(self):
-        # Command the device off and let the worker deliver it before exiting.
-        # If that final OFF never lands, the device's comms watchdog still trips
-        # (heartbeats stop below), so the heater fails safe regardless.
-        self._desired_target = 0.
+        with self._state_lock:
+            self._desired_target = 0.
+            self._intent_seq += 1
+            self._lease_id = None
         self._running = False
         self._wake.set()
 
     def _run(self):
         fail_shift = 0
+        next_heartbeat = 0.
         while self._running:
-            wrote_ok = True
+            cycle_ok = True
             try:
-                self._drain_commands()
-                # 1. Fast-path our OWN intent FIRST, before the (possibly slow)
-                #    status poll. This is what makes an explicit or forced OFF land
-                #    promptly instead of waiting out a stalled /status (up to the
-                #    4s HTTP timeout). Passing no device state means this only fires
-                #    when the desired target changed or is unknown (force_off).
-                if not self._sync_target(None, False):
-                    wrote_ok = False
-                # 2. Poll status (may be slow / time out).
-                st = self._get_status()
-                if st is not None:
-                    self._on_message(st)
-                    # 3. Reconcile again against the device's REPORTED state, to
-                    #    correct external drift (uncommanded heating, reboot, button,
-                    #    WebUI) that our own-intent fast-path can't see.
-                    if not self._sync_target(st.get("target"), bool(st.get("heating"))):
-                        wrote_ok = False
-                else:
-                    self._on_disconnect()
-                    wrote_ok = False
-                # Feed the device comms watchdog only while we want heat.
-                if self._desired_target > 0.:
-                    self._post("/heartbeat", quiet=True)
+                if self._latest_state is None:
+                    self._handshake()
+                    self._get_state()
+                if not self._drain_commands():
+                    cycle_ok = False
+                if not self._sync_intent():
+                    cycle_ok = False
+                if not self._event_live:
+                    self._get_state()
+                now = time.monotonic()
+                with self._state_lock:
+                    lease = self._lease_id
+                if lease and now >= next_heartbeat:
+                    if self._heartbeat(lease):
+                        next_heartbeat = now + HEARTBEAT_INTERVAL
+                    else:
+                        cycle_ok = False
             except Exception as exc:
                 logger.debug("dragonbreath: worker cycle error: %s", exc)
                 self._on_disconnect()
-                wrote_ok = False
-            # Steady poll when in sync; exponential backoff while a needed write
-            # is failing, so a downed device doesn't get hammered.
-            fail_shift = 0 if wrote_ok else min(fail_shift + 1, WRITE_BACKOFF_MAX_SHIFT)
+                cycle_ok = False
+            fail_shift = 0 if cycle_ok else min(
+                fail_shift + 1, WRITE_BACKOFF_MAX_SHIFT)
             delay = self._poll * (1 << fail_shift)
             if self._wake.wait(timeout=delay):
                 self._wake.clear()
-        # Best-effort final OFF, from the worker thread — never the reactor.
+        # Best-effort v2 OFF from the worker. If delivery fails, heartbeats have
+        # already stopped and the device lease expires fail-safe.
         try:
-            self._post("/target?t=0")
+            self._send_command("off", {}, expected_revision=None,
+                               request_id=uuid.uuid4().hex, quiet=True)
         except Exception:
             pass
 
     # -- control (called on the reactor thread; assign/enqueue only, never I/O) --
     def set_target(self, degrees):
-        self._desired_target = max(0., float(degrees))
+        with self._state_lock:
+            self._desired_target = max(0., float(degrees))
+            if self._desired_target <= 0.:
+                self._lease_id = None
+            self._intent_seq += 1
+            self._pending = None
         self._wake.set()
 
     def force_off(self):
-        # Unconditionally (re)assert OFF: clearing the confirmed-state cache makes
-        # the next reconcile POST /target?t=0 even if we believe the device is
-        # already at 0. Guarantees connect/disconnect/shutdown force-offs are sent.
-        self._desired_target = 0.
-        self._last_sent_target = None
+        with self._state_lock:
+            self._desired_target = 0.
+            self._intent_seq += 1
+            self._pending = None
+            self._lease_id = None
         self._wake.set()
 
     def reset_fault(self):
-        self._cmd_queue.append("reset")
+        self._cmd_queue.append({
+            "command": "clear_fault",
+            "request_id": uuid.uuid4().hex,
+            "expected_revision": self._current_revision(),
+        })
         self._wake.set()
 
-    # -- worker-side helpers (all HTTP happens here) --
+    # -- worker-side command path --
     def _drain_commands(self):
+        ok = True
         while True:
             try:
-                cmd = self._cmd_queue.popleft()
+                pending = self._cmd_queue.popleft()
             except IndexError:
                 break
-            if cmd == "reset":
-                self._post("/reset")
+            if pending["expected_revision"] is None:
+                try:
+                    self._get_state()
+                except Exception:
+                    self._cmd_queue.appendleft(pending)
+                    return False
+                pending["expected_revision"] = self._current_revision()
+            try:
+                status, data = self._send_command(
+                    pending["command"], {}, pending["expected_revision"],
+                    pending["request_id"])
+            except Exception:
+                self._cmd_queue.appendleft(pending)
+                return False
+            if 200 <= status < 300:
+                self._accept_state(data.get("state"))
+            elif status in (400, 403, 409):
+                self._accept_state(data.get("state"))
+                self._notify_protocol_error(data)
+            else:
+                self._cmd_queue.appendleft(pending)
+                ok = False
+                break
+        return ok
 
-    def _sync_target(self, dev_target, dev_heating):
-        """Reconcile the device to the desired target, POSTing /target when needed.
-
-        Crucially this checks the device's REPORTED state, not just our own last
-        write, so it corrects heating we never commanded — initial force-off,
-        uncommanded heating, device reboot drift, and physical-button / WebUI
-        changes all show up as a device target/heating that disagrees with what we
-        want, and get driven back. A target write also counts as device liveness.
-
-        Returns True if in sync or the write succeeded, False if a needed write
-        failed (so the caller backs off and retries).
-        """
-        desired = self._desired_target
-        need = False
-        if self._last_sent_target is None:
-            need = True                                    # unknown -> assert desired
-        elif dev_target is not None and abs(dev_target - desired) > 0.01:
-            need = True                                    # device diverged from desired
-        elif dev_heating and desired <= 0.:
-            need = True                                    # device hot but we want off
-        elif desired != self._last_sent_target:
-            need = True                                    # desired changed since last send
-        if not need:
+    def _sync_intent(self):
+        with self._state_lock:
+            seq = self._intent_seq
+            desired = self._desired_target
+            pending = self._pending
+        if seq == self._applied_seq:
             return True
-        if self._post("/target?t=%g" % desired):
-            self._last_sent_target = desired
+        if pending is None or pending["seq"] != seq:
+            command = "off" if desired <= 0. else "power_on"
+            fields = {} if command == "off" else {"target_c": desired}
+            revision = None
+            if command != "off":
+                revision = self._current_revision()
+                if revision is None:
+                    self._get_state()
+                    revision = self._current_revision()
+                    if revision is None:
+                        return False
+            pending = {
+                "seq": seq,
+                "target": desired,
+                "command": command,
+                "fields": fields,
+                "request_id": uuid.uuid4().hex,
+                "expected_revision": revision,
+            }
+            with self._state_lock:
+                self._pending = pending
+        try:
+            status, data = self._send_command(
+                pending["command"], pending["fields"],
+                pending["expected_revision"],
+                pending["request_id"])
+        except Exception:
+            return False  # retry the same request_id: firmware replay is idempotent
+        if 200 <= status < 300:
+            if pending["command"] == "power_on":
+                lease_id = data.get("lease_id")
+                if not isinstance(lease_id, str) or len(lease_id) != 32:
+                    self._accept_state(data.get("state"))
+                    self._notify_protocol_error({
+                        "error": "missing_lease_id",
+                        "message": "POWER_ON response did not include an exact lease",
+                    })
+                    # Fail safe and schedule an unconditional OFF. A successful
+                    # heat command is not owned until its private lease arrives.
+                    with self._state_lock:
+                        self._lease_id = None
+                        self._desired_target = 0.
+                        self._intent_seq += 1
+                        if self._pending is pending:
+                            self._pending = None
+                    return False
+                with self._state_lock:
+                    self._lease_id = lease_id
+            self._accept_state(data.get("state"))
+            self._applied_target = pending["target"]
+            self._applied_seq = pending["seq"]
+            with self._state_lock:
+                if self._pending is pending:
+                    self._pending = None
+            return True
+        if status in (400, 403, 409):
+            self._accept_state(data.get("state"))
+            self._notify_protocol_error(data)
+            self._applied_seq = pending["seq"]  # explicit rejection is terminal
+            with self._state_lock:
+                if pending["target"] > 0.:
+                    self._desired_target = 0.
+                    self._lease_id = None
+                if self._pending is pending:
+                    self._pending = None
             return True
         return False
 
-    # -- HTTP helpers (stdlib urllib) --
-    def _get_status(self):
-        req = urllib.request.Request(self._base + "/status", method="GET")
-        t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=4.) as r:
-            raw = r.read()
-        self._log_latency("GET", "/status", (time.monotonic() - t0) * 1000., True,
-                          quiet=True)
-        data = json.loads(raw.decode("utf-8", "replace"))
-        state = {}
-        # DragonBreath emits JSON null for a non-OK sensor; treat that as "no reading"
-        # rather than 0 so a sensor fault can't masquerade as a cold chamber.
-        if data.get("temp") is not None:
-            state["temperature"] = float(data["temp"])
-        if data.get("target") is not None:
-            state["target"] = float(data["target"])
-        if data.get("ptc") is not None:
-            state["ptc"] = float(data["ptc"])
-        state["heating"] = bool(data.get("heating"))
-        state["fault"] = bool(data.get("fault"))
-        state["fault_reason"] = data.get("fault_reason")
-        return state
+    def _send_command(self, name, fields, expected_revision, request_id,
+                      quiet=False):
+        body = {
+            "api_version": API_VERSION,
+            "request_id": request_id,
+            "actor": {"kind": "klipper", "id": self._actor_id},
+            "command": dict({"name": name}, **fields),
+        }
+        if expected_revision is not None:
+            body["expected_revision"] = expected_revision
+        return self._request_json("POST", "/api/v2/command", body, quiet=quiet)
 
-    def _post(self, path, quiet=False):
-        """POST to the device. Returns True on 2xx, False otherwise. Never raises
-        (all HTTP lives on the worker thread; failures must not escape)."""
+    def _heartbeat(self, lease_id):
+        status, data = self._request_json(
+            "POST", "/api/v2/heartbeat",
+            {"api_version": API_VERSION, "lease_id": lease_id}, quiet=True)
+        if 200 <= status < 300:
+            return True
+        self._accept_state(data.get("state"))
+        self._notify_protocol_error(data)
+        if status in (400, 403, 409):
+            with self._state_lock:
+                if self._lease_id == lease_id:
+                    self._lease_id = None
+                    self._desired_target = 0.
+            return True
+        return False
+
+    # -- authoritative state + API handshake --
+    def _handshake(self):
+        status, data = self._request_json("GET", "/api/v2/info", quiet=True)
+        if status != 200 or data.get("api_version") != API_VERSION:
+            self._notify_protocol_error({"error": "unsupported_api_version"})
+            raise RuntimeError(
+                "DragonBreath API v2 required (device returned HTTP %s, API %r)"
+                % (status, data.get("api_version")))
+
+    def _get_state(self):
+        status, data = self._request_json("GET", "/api/v2/state", quiet=True)
+        if status != 200:
+            raise RuntimeError("GET /api/v2/state returned HTTP %s" % status)
+        self._accept_state(data)
+        return data
+
+    def _current_revision(self):
+        with self._state_lock:
+            if self._latest_state is None:
+                return None
+            return int(self._latest_state["state_revision"])
+
+    def _accept_state(self, data):
+        if not isinstance(data, dict) or data.get("api_version") != API_VERSION:
+            return False
+        try:
+            revision = int(data["state_revision"])
+            boot_id = str(data["boot_id"])
+            lease = data["control"]["lease"]
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        with self._state_lock:
+            old = self._latest_state
+            if (old is not None and old.get("boot_id") == boot_id
+                    and revision < int(old.get("state_revision", 0))):
+                return False
+            old_lease = self._lease_id
+            if old is not None and old.get("boot_id") != boot_id:
+                self._lease_id = None
+            owner_matches = bool(
+                lease.get("active")
+                and lease.get("owner") == self._actor_id
+                and data.get("source") == "klipper")
+            owned = bool(
+                self._lease_id
+                and self._desired_target > 0.
+                and owner_matches)
+            if self._lease_id and not owned:
+                self._lease_id = None
+                self._desired_target = 0.
+            self._latest_state = data
+            countermanded = bool(old_lease and not owned)
+
+        flat = self._flatten_state(data)
+        flat["lease_owned"] = owned
+        flat["countermanded"] = countermanded
+        self._on_message(flat)
+        return True
+
+    def _flatten_state(self, data):
+        sensors = data.get("sensors") or {}
+        chamber = sensors.get("chamber") or {}
+        ptc = sensors.get("ptc") or {}
+        target = data.get("target") or {}
+        heater = data.get("heater") or {}
+        fan = data.get("fan") or {}
+        environment = data.get("environment") or {}
+        safety = data.get("safety") or {}
+        control = data.get("control") or {}
+        lease = control.get("lease") or {}
+        return {
+            "temperature": chamber.get("temperature_c"),
+            "chamber_status": chamber.get("status"),
+            "target": target.get("effective_c"),
+            "requested_target": target.get("requested_c"),
+            "ptc": ptc.get("temperature_c"),
+            "ptc_status": ptc.get("status"),
+            "heating": bool(heater.get("output")),
+            "heater_demand": bool(heater.get("demand")),
+            "fan_percent": fan.get("effective_percent"),
+            "fan_reason": fan.get("reason"),
+            "moonraker_connected": bool(
+                environment.get("moonraker_connected")),
+            "fault": bool(safety.get("fault_latched")
+                          or safety.get("inhibited")),
+            "inhibited": bool(safety.get("inhibited")),
+            "fault_reason": safety.get("reason"),
+            "mode": data.get("mode"),
+            "source": data.get("source"),
+            "state_revision": data.get("state_revision"),
+            "boot_id": data.get("boot_id"),
+            "firmware": data.get("firmware"),
+            "lease_owner": lease.get("owner"),
+        }
+
+    def _notify_protocol_error(self, data):
+        if not isinstance(data, dict):
+            return
+        code = data.get("error")
+        if code:
+            if code != self._last_protocol_error:
+                logger.warning("dragonbreath: API command rejected: %s (%s)",
+                               code, data.get("message", "no detail"))
+            self._last_protocol_error = code
+            self._on_message({"protocol_error": code})
+
+    # -- SSE observer with polling fallback in the command worker --
+    def _event_run(self):
+        while self._running:
+            try:
+                req = urllib.request.Request(
+                    self._base + "/api/v2/events", method="GET",
+                    headers={"Accept": "text/event-stream"})
+                with urllib.request.urlopen(req, timeout=6.) as response:
+                    self._event_response = response
+                    data_lines = []
+                    for raw in response:
+                        if not self._running:
+                            break
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if not line:
+                            if data_lines:
+                                state = json.loads("\n".join(data_lines))
+                                if self._accept_state(state):
+                                    self._event_live = True
+                                data_lines = []
+                            continue
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                logger.debug("dragonbreath: SSE HTTP %s", exc.code)
+            except Exception as exc:
+                logger.debug("dragonbreath: SSE disconnected: %s", exc)
+            finally:
+                self._event_response = None
+                self._event_live = False
+            if self._running:
+                self._wake.set()  # command worker begins polling immediately
+                time.sleep(min(1., self._poll))
+
+    # -- HTTP helpers (stdlib urllib; never called by the reactor) --
+    def _request_json(self, method, path, body=None, quiet=False):
+        raw_body = None if body is None else json.dumps(
+            body, separators=(",", ":")).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            headers.update({
+                "Content-Type": "application/json",
+                "X-DragonBreath-Auth": self._token,
+            })
         req = urllib.request.Request(
-            self._base + path, data=b"", method="POST",
-            headers={"X-DragonBreath-Auth": self._token})
+            self._base + path, data=raw_body, method=method, headers=headers)
         t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=4.) as r:
-                r.read()
-            self._log_latency("POST", path, (time.monotonic() - t0) * 1000., True,
-                              quiet=quiet)
-            return True
+                raw = r.read()
+                status = r.status
+            self._log_latency(method, path, (time.monotonic() - t0) * 1000.,
+                              True, quiet=quiet)
+            return status, json.loads(raw.decode("utf-8", "replace") or "{}")
         except urllib.error.HTTPError as exc:
-            # 409 (fault latched / inhibited) and 403 (bad token) are actionable.
-            # HTTPError IS the response object; close it so it doesn't leak a socket
-            # (ResourceWarning) when we don't read/context-manage it.
+            raw = exc.read()
+            status = exc.code
             exc.close()
             dt_ms = (time.monotonic() - t0) * 1000.
-            logger.warning("dragonbreath: POST %s -> HTTP %s in %.0fms",
-                           path, exc.code, dt_ms)
-            return False
-        except Exception as exc:
-            dt_ms = (time.monotonic() - t0) * 1000.
-            logger.debug("dragonbreath: POST %s failed in %.0fms: %s", path, dt_ms, exc)
-            return False
+            logger.warning("dragonbreath: %s %s -> HTTP %s in %.0fms",
+                           method, path, status, dt_ms)
+            try:
+                data = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except ValueError:
+                data = {}
+            return status, data
 
     def _log_latency(self, method, path, dt_ms, ok, quiet=False):
         # A slow request is always worth a WARN — it is exactly the latency that
@@ -316,12 +541,28 @@ class DragonBreath:
         self.temperature = 0.
         self.target = 0.           # target Klipper wants (desired)
         self.device_target = 0.    # target the device reports (confirmed)
+        self.device_requested_target = 0.
         self.smoothed_temp = 0.
         self.is_connected = False
         self.device_heating = False
+        self.heater_demand = False
         self.device_fault = False
+        self.device_inhibited = False
         self.fault_reason = None
         self.ptc_temp = 0.
+        self.chamber_status = "uninit"
+        self.ptc_status = "uninit"
+        self.fan_percent = 0
+        self.fan_reason = "off"
+        self.device_moonraker_connected = False
+        self.mode = "off"
+        self.source = "boot"
+        self.state_revision = 0
+        self.boot_id = None
+        self.firmware_version = None
+        self.lease_owner = None
+        self.lease_owned = False
+        self.protocol_error = None
         self._last_temp_time = 0.
         self._in_shutdown = False
         self._external_off_lockout = False
@@ -451,7 +692,7 @@ class DragonBreath:
     def _cmd_reset(self, gcmd):
         try:
             self._transport.reset_fault()
-            gcmd.respond_info("DragonBreath: sent fault reset")
+            gcmd.respond_info("DragonBreath: queued fault clear")
         except Exception as exc:
             raise gcmd.error("DragonBreath reset failed: %s" % exc)
 
@@ -461,12 +702,23 @@ class DragonBreath:
         self._state_queue.append(data)
 
     def _on_disconnect(self):
-        self.is_connected = False
+        self._state_queue.append({"_disconnected": True})
 
     def _reactor_poll(self, eventtime):
         while self._state_queue:
             data = self._state_queue.popleft()
+            if data.get("_disconnected"):
+                self.is_connected = False
+                continue
+            if data.get("protocol_error"):
+                self.protocol_error = data["protocol_error"]
+                if self.target > 0.:
+                    self._clear_heater_target_state()
+                    self.target = 0.
+                    self._external_off_lockout = True
+                continue
             self.is_connected = True
+            self.protocol_error = None
             temp = data.get("temperature")
             if temp is not None:
                 self.temperature = float(temp)
@@ -476,9 +728,34 @@ class DragonBreath:
                 self.ptc_temp = float(data["ptc"])
             if data.get("target") is not None:
                 self.device_target = float(data["target"])
+            if data.get("requested_target") is not None:
+                self.device_requested_target = float(
+                    data["requested_target"])
             self.device_heating = bool(data.get("heating"))
+            self.heater_demand = bool(data.get("heater_demand"))
             self.device_fault = bool(data.get("fault"))
+            self.device_inhibited = bool(data.get("inhibited"))
             self.fault_reason = data.get("fault_reason")
+            self.chamber_status = data.get("chamber_status") or "uninit"
+            self.ptc_status = data.get("ptc_status") or "uninit"
+            self.fan_percent = int(data.get("fan_percent") or 0)
+            self.fan_reason = data.get("fan_reason") or "off"
+            self.device_moonraker_connected = bool(
+                data.get("moonraker_connected"))
+            self.mode = data.get("mode") or "off"
+            self.source = data.get("source") or "unknown"
+            self.state_revision = int(data.get("state_revision") or 0)
+            self.boot_id = data.get("boot_id")
+            self.firmware_version = data.get("firmware")
+            self.lease_owner = data.get("lease_owner")
+            self.lease_owned = bool(data.get("lease_owned"))
+            if data.get("countermanded"):
+                logger.warning(
+                    "dragonbreath: Klipper lease countermanded by %s; "
+                    "accepting authoritative device state", self.source)
+                self._clear_heater_target_state()
+                self.target = 0.
+                self._external_off_lockout = True
 
         # Feed the heater sensor callback every cycle, on the MCU clock so
         # verify_heater compares timestamps from the right domain.
@@ -496,9 +773,8 @@ class DragonBreath:
                            eventtime - self._last_temp_time)
             self._last_temp_time = eventtime
 
-        # Keep the device target synced to the heater's target, and force off any
-        # uncommanded device heating — the device may only heat while Klipper is
-        # commanding it (belt-and-suspenders alongside the device's own watchdog).
+        # A fresh Klipper command creates a fresh lease. Device state is otherwise
+        # authoritative: physical/WebUI/safety actions are reflected, not fought.
         heater_target = self._lookup_heater_target()
         if heater_target is not None and abs(heater_target - self.target) > 0.01:
             if self._external_off_lockout and heater_target > 0.:
@@ -506,13 +782,6 @@ class DragonBreath:
                             heater_target)
             else:
                 self.set_device_target(heater_target)
-
-        klipper_wants_off = (heater_target is not None and heater_target <= 0.) \
-            or (heater_target is None and self.target <= 0.)
-        if self.device_heating and klipper_wants_off:
-            logger.warning("dragonbreath: device heating while Klipper commands off "
-                           "— forcing off (uncommanded heating)")
-            self._force_device_off("uncommanded device-on")
 
         return eventtime + REACTOR_POLL
 
@@ -540,12 +809,29 @@ class DragonBreath:
             "temperature": self.temperature,
             "target": self.target,
             "device_target": self.device_target,
+            "device_requested_target": self.device_requested_target,
             "smoothed_temp": self.smoothed_temp,
             "connected": self.is_connected,
             "heating": self.device_heating,
+            "heater_demand": self.heater_demand,
             "fault": self.device_fault,
+            "inhibited": self.device_inhibited,
             "fault_reason": self.fault_reason,
             "ptc_temp": self.ptc_temp,
+            "chamber_status": self.chamber_status,
+            "ptc_status": self.ptc_status,
+            "fan_percent": self.fan_percent,
+            "fan_reason": self.fan_reason,
+            "device_moonraker_connected": self.device_moonraker_connected,
+            "api_version": API_VERSION,
+            "mode": self.mode,
+            "source": self.source,
+            "state_revision": self.state_revision,
+            "boot_id": self.boot_id,
+            "firmware_version": self.firmware_version,
+            "lease_owner": self.lease_owner,
+            "lease_owned": self.lease_owned,
+            "protocol_error": self.protocol_error,
         }
 
 
@@ -596,7 +882,10 @@ class DragonBreathVirtualPin:
                     self.module.set_device_target(0)
             elif self.module._external_off_lockout:
                 pass
-            elif target != self.module.target or self.last_value == 0:
+            # The heater's PWM output may cycle many times at one target. A target
+            # command is an ownership transition, not a PWM edge: never create a
+            # fresh API lease just because watermark control toggled back on.
+            elif target != self.module.target:
                 self.module.set_device_target(target)
         self.last_value = value
 
