@@ -15,14 +15,22 @@ It talks to OpenBreath's HTTP control API over your LAN (no MQTT broker, no clou
 ## How it works
 - Registers a `sensor_type: openbreath` + a `heater_pin: openbreath:pwm` virtual
   pin, so a normal `[heater_generic]` renders as a chamber heater card in Fluidd.
-- A reactor timer polls `GET /status` and feeds the temperature into the heater's
-  sensor callback (on the MCU clock, so `verify_heater` works).
-- Setting the heater target (M141 / `SET_HEATER_TEMPERATURE` / the Fluidd card)
-  is pushed to the device with `POST /target?t=<C>`.
-- While a target is set, the module `POST /heartbeat`s every poll. If Klipper
+- **All network I/O runs on a single background worker thread** — Klipper's
+  reactor never blocks on the device. Setting the heater target
+  (M141 / `SET_HEATER_TEMPERATURE` / the Fluidd card) just hands the *desired*
+  target to the worker and returns immediately; the worker POSTs `/target?t=<C>`,
+  retrying with backoff until the device accepts it. (This is deliberate: a
+  synchronous HTTP write on the reactor could stall it long enough to trip
+  "Timer Too Close" and shut the MCU down mid-print.)
+- The worker also polls `GET /status` and feeds the temperature into the heater's
+  sensor callback (on the MCU clock, so `verify_heater` works). Both the
+  Klipper-desired target and the device-reported target are exposed on the
+  `openbreath` object (`target` vs `device_target`) so divergence is visible.
+- While a target is set, the worker `POST /heartbeat`s every poll. If Klipper
   crashes/hangs the heartbeats stop and OpenBreath's own comms watchdog latches
-  the heater off. On Klipper disconnect/shutdown the module also force-offs the
-  device, and it force-offs any *uncommanded* device heating.
+  the heater off — **that watchdog, not the OFF request, is the real fail-safe.**
+  On Klipper disconnect/shutdown the module commands the device off (delivered by
+  the worker) and force-offs any *uncommanded* device heating.
 - Every mutating request carries the `X-OpenBreath-Auth` header.
 
 ## Install
