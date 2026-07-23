@@ -1,42 +1,42 @@
-# openbreath.py — Klipper extras module for the OpenBreath chamber heater.
+# dragonbreath.py — Klipper extras module for the DragonBreath chamber heater.
 #
-# Surfaces an OpenBreath-firmware Panda Breath as a standard Klipper heater
+# Surfaces an DragonBreath-firmware Panda Breath as a standard Klipper heater
 # (heater_generic interface), so it shows up in Fluidd/Mainsail as a chamber
 # heater with a live temperature and a settable target, and can be driven with
 # M141 / M191.
 #
-# It talks to the OpenBreath HTTP control API (see the OpenBreath firmware):
+# It talks to the DragonBreath HTTP control API (see the DragonBreath firmware):
 #   GET  /status        -> {temp,target,heating,fault,fault_reason,...}
 #   POST /target?t=<C>  -> set chamber setpoint (0 = off); counts as liveness
 #   POST /heartbeat     -> controller liveness (feeds the device comms watchdog)
 #   POST /reset         -> clear a latched device fault
-# Every mutating call carries the X-OpenBreath-Auth header (CSRF gate / token).
+# Every mutating call carries the X-DragonBreath-Auth header (CSRF gate / token).
 #
 # This is a focused fork of Justin Hayes' pandabreath-klipper: it keeps the
 # proven Klipper glue (sensor factory + virtual pin -> heater_generic, the
 # reactor-poll sensor feed, and the fail-safe force-off) and drops the stock
 # firmware's WebSocket/MQTT transports and work-mode/drying/filament machinery,
-# which OpenBreath does not use.
+# which DragonBreath does not use.
 #
 # No external Python dependencies — stdlib only.
 #
 # printer.cfg:
-#   [openbreath]
-#   host: 10.168.2.53        # OpenBreath device IP or hostname
+#   [dragonbreath]
+#   host: 10.168.2.53        # DragonBreath device IP or hostname
 #   #port: 80
-#   #token: web              # X-OpenBreath-Auth value; set this if you configured
+#   #token: web              # X-DragonBreath-Auth value; set this if you configured
 #                            # a control token on the device (NVS ctl_token)
 #   #poll_interval: 2.0
 #
-#   [heater_generic openbreath]
-#   heater_pin: openbreath:pwm
-#   sensor_type: openbreath
+#   [heater_generic dragonbreath]
+#   heater_pin: dragonbreath:pwm
+#   sensor_type: dragonbreath
 #   control: watermark
 #   max_delta: 2.0
 #   min_temp: 0
 #   max_temp: 75
 #
-#   [verify_heater openbreath]
+#   [verify_heater dragonbreath]
 #   check_gain_time: 300
 #   hysteresis: 5
 #   heating_gain: 1
@@ -66,10 +66,10 @@ HTTP_SLOW_WARN_MS = 1000.
 WRITE_BACKOFF_MAX_SHIFT = 3
 
 
-# ─── OpenBreath HTTP transport ────────────────────────────────────────────────
+# ─── DragonBreath HTTP transport ────────────────────────────────────────────────
 
-class _OpenBreathHTTP:
-    """Background HTTP client for the OpenBreath control API.
+class _DragonBreathHTTP:
+    """Background HTTP client for the DragonBreath control API.
 
     A single daemon worker thread is the SOLE owner of every HTTP call — status
     polls, heartbeats, target writes, and fault resets. The reactor thread never
@@ -84,7 +84,7 @@ class _OpenBreathHTTP:
     target is commanded — POSTs /heartbeat so the device's comms watchdog stays
     fed only as long as Klipper is alive. If Klippy crashes/hangs the heartbeats
     stop and the device latches the heater off; that watchdog, not the OFF POST,
-    is the real fail-safe. Mutating calls carry the X-OpenBreath-Auth header.
+    is the real fail-safe. Mutating calls carry the X-DragonBreath-Auth header.
     """
 
     def __init__(self, host, port, token, on_message, on_disconnect, poll):
@@ -115,7 +115,7 @@ class _OpenBreathHTTP:
     def start(self):
         self._running = True
         self._thread = threading.Thread(
-            target=self._run, name="openbreath_http", daemon=True)
+            target=self._run, name="dragonbreath_http", daemon=True)
         self._thread.start()
 
     def stop(self):
@@ -155,7 +155,7 @@ class _OpenBreathHTTP:
                 if self._desired_target > 0.:
                     self._post("/heartbeat", quiet=True)
             except Exception as exc:
-                logger.debug("openbreath: worker cycle error: %s", exc)
+                logger.debug("dragonbreath: worker cycle error: %s", exc)
                 self._on_disconnect()
                 wrote_ok = False
             # Steady poll when in sync; exponential backoff while a needed write
@@ -236,7 +236,7 @@ class _OpenBreathHTTP:
                           quiet=True)
         data = json.loads(raw.decode("utf-8", "replace"))
         state = {}
-        # OpenBreath emits JSON null for a non-OK sensor; treat that as "no reading"
+        # DragonBreath emits JSON null for a non-OK sensor; treat that as "no reading"
         # rather than 0 so a sensor fault can't masquerade as a cold chamber.
         if data.get("temp") is not None:
             state["temperature"] = float(data["temp"])
@@ -254,7 +254,7 @@ class _OpenBreathHTTP:
         (all HTTP lives on the worker thread; failures must not escape)."""
         req = urllib.request.Request(
             self._base + path, data=b"", method="POST",
-            headers={"X-OpenBreath-Auth": self._token})
+            headers={"X-DragonBreath-Auth": self._token})
         t0 = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=4.) as r:
@@ -268,32 +268,32 @@ class _OpenBreathHTTP:
             # (ResourceWarning) when we don't read/context-manage it.
             exc.close()
             dt_ms = (time.monotonic() - t0) * 1000.
-            logger.warning("openbreath: POST %s -> HTTP %s in %.0fms",
+            logger.warning("dragonbreath: POST %s -> HTTP %s in %.0fms",
                            path, exc.code, dt_ms)
             return False
         except Exception as exc:
             dt_ms = (time.monotonic() - t0) * 1000.
-            logger.debug("openbreath: POST %s failed in %.0fms: %s", path, dt_ms, exc)
+            logger.debug("dragonbreath: POST %s failed in %.0fms: %s", path, dt_ms, exc)
             return False
 
     def _log_latency(self, method, path, dt_ms, ok, quiet=False):
         # A slow request is always worth a WARN — it is exactly the latency that
         # would have starved the MCU queue back when this ran on the reactor.
         if dt_ms >= HTTP_SLOW_WARN_MS:
-            logger.warning("openbreath: %s %s -> %s in %.0fms (slow)",
+            logger.warning("dragonbreath: %s %s -> %s in %.0fms (slow)",
                            method, path, "ok" if ok else "fail", dt_ms)
         elif quiet:
-            logger.debug("openbreath: %s %s -> %s in %.0fms",
+            logger.debug("dragonbreath: %s %s -> %s in %.0fms",
                          method, path, "ok" if ok else "fail", dt_ms)
         else:
-            logger.info("openbreath: %s %s -> %s in %.0fms",
+            logger.info("dragonbreath: %s %s -> %s in %.0fms",
                         method, path, "ok" if ok else "fail", dt_ms)
 
 
 # ─── Klipper heater module ────────────────────────────────────────────────────
 
-class OpenBreath:
-    """Klipper extras module — exposes the OpenBreath chamber as a virtual heater.
+class DragonBreath:
+    """Klipper extras module — exposes the DragonBreath chamber as a virtual heater.
 
     Registers a sensor factory and a virtual PWM chip so the user can declare a
     standard [heater_generic] against it; the heater's set_temp is hooked so a
@@ -332,15 +332,15 @@ class OpenBreath:
         self._heater_set_temp_orig = None
         self._state_queue = collections.deque()
 
-        self._transport = _OpenBreathHTTP(
+        self._transport = _DragonBreathHTTP(
             host, port, token, self._enqueue, self._on_disconnect, poll)
 
-        # 1. Sensor factory  -> sensor_type: openbreath
+        # 1. Sensor factory  -> sensor_type: dragonbreath
         pheaters = self.printer.load_object(config, 'heaters')
-        pheaters.add_sensor_factory("openbreath", self._create_sensor)
-        # 2. Virtual chip     -> heater_pin: openbreath:pwm
+        pheaters.add_sensor_factory("dragonbreath", self._create_sensor)
+        # 2. Virtual chip     -> heater_pin: dragonbreath:pwm
         ppins = self.printer.lookup_object('pins')
-        ppins.register_chip('openbreath', self)
+        ppins.register_chip('dragonbreath', self)
 
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
@@ -350,26 +350,26 @@ class OpenBreath:
             self._reactor_poll, self.reactor.NEVER)
 
         gcode = self.printer.lookup_object('gcode')
-        gcode.register_command("OPENBREATH_RESET", self._cmd_reset,
-                               desc="Clear a latched OpenBreath device fault")
+        gcode.register_command("DRAGONBREATH_RESET", self._cmd_reset,
+                               desc="Clear a latched DragonBreath device fault")
         if self._register_macros:
             # M141/M191 aren't native Klipper — register them for the chamber
             # heater. Opt out with register_macros: False if you define your own.
             gcode.register_command("M141", self._cmd_M141,
-                                   desc="Set chamber temperature (OpenBreath)")
+                                   desc="Set chamber temperature (DragonBreath)")
             gcode.register_command("M191", self._cmd_M191,
-                                   desc="Set chamber temperature and wait (OpenBreath)")
+                                   desc="Set chamber temperature and wait (DragonBreath)")
 
     def _create_sensor(self, config):
-        self._sensor = OpenBreathSensor(config, self)
+        self._sensor = DragonBreathSensor(config, self)
         return self._sensor
 
     def setup_pin(self, pin_type, pin_params):
         if pin_params['pin'] == 'pwm':
-            self._virtual_pin = OpenBreathVirtualPin(self)
+            self._virtual_pin = DragonBreathVirtualPin(self)
             return self._virtual_pin
         raise self.printer.config.error(
-            "Unknown openbreath pin: %s" % (pin_params['pin'],))
+            "Unknown dragonbreath pin: %s" % (pin_params['pin'],))
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -398,7 +398,7 @@ class OpenBreath:
         try:
             self._transport.force_off()
         except Exception as exc:
-            logger.warning("openbreath: failed to force off on %s: %s", reason, exc)
+            logger.warning("dragonbreath: failed to force off on %s: %s", reason, exc)
 
     def _attach_heater_hook(self):
         if self._heater_set_temp_orig is not None:
@@ -407,7 +407,7 @@ class OpenBreath:
             pheaters = self.printer.lookup_object('heaters')
             heater = pheaters.lookup_heater(self.name)
         except Exception as exc:
-            logger.warning("openbreath: unable to hook heater '%s': %s", self.name, exc)
+            logger.warning("dragonbreath: unable to hook heater '%s': %s", self.name, exc)
             return
         self._heater = heater
         self._heater_set_temp_orig = heater.set_temp
@@ -427,7 +427,7 @@ class OpenBreath:
         try:
             self._heater_set_temp_orig(0.)
         except Exception as exc:
-            logger.debug("openbreath: unable to clear heater target state: %s", exc)
+            logger.debug("dragonbreath: unable to clear heater target state: %s", exc)
 
     # ── gcode ───────────────────────────────────────────────────────────────
 
@@ -444,16 +444,16 @@ class OpenBreath:
             try:
                 heater = pheaters.lookup_heater(self.name)
             except Exception:
-                raise gcmd.error("openbreath: heater '%s' not found — is "
+                raise gcmd.error("dragonbreath: heater '%s' not found — is "
                                  "[heater_generic %s] configured?" % (self.name, self.name))
         pheaters.set_temperature(heater, temp, wait)
 
     def _cmd_reset(self, gcmd):
         try:
             self._transport.reset_fault()
-            gcmd.respond_info("OpenBreath: sent fault reset")
+            gcmd.respond_info("DragonBreath: sent fault reset")
         except Exception as exc:
-            raise gcmd.error("OpenBreath reset failed: %s" % exc)
+            raise gcmd.error("DragonBreath reset failed: %s" % exc)
 
     # ── state queue + reactor poll ────────────────────────────────────────────
 
@@ -492,7 +492,7 @@ class OpenBreath:
 
         if (self._last_temp_time > 0.
                 and eventtime - self._last_temp_time > TEMP_STALE_WARN):
-            logger.warning("openbreath: temperature data stale (%.0fs)",
+            logger.warning("dragonbreath: temperature data stale (%.0fs)",
                            eventtime - self._last_temp_time)
             self._last_temp_time = eventtime
 
@@ -502,7 +502,7 @@ class OpenBreath:
         heater_target = self._lookup_heater_target()
         if heater_target is not None and abs(heater_target - self.target) > 0.01:
             if self._external_off_lockout and heater_target > 0.:
-                logger.info("openbreath: ignoring synced target %.1f after forced off",
+                logger.info("dragonbreath: ignoring synced target %.1f after forced off",
                             heater_target)
             else:
                 self.set_device_target(heater_target)
@@ -510,7 +510,7 @@ class OpenBreath:
         klipper_wants_off = (heater_target is not None and heater_target <= 0.) \
             or (heater_target is None and self.target <= 0.)
         if self.device_heating and klipper_wants_off:
-            logger.warning("openbreath: device heating while Klipper commands off "
+            logger.warning("dragonbreath: device heating while Klipper commands off "
                            "— forcing off (uncommanded heating)")
             self._force_device_off("uncommanded device-on")
 
@@ -529,7 +529,7 @@ class OpenBreath:
 
     def set_device_target(self, degrees):
         if self._in_shutdown and float(degrees) > 0.:
-            logger.info("openbreath: ignoring target %.1f while Klipper is shutdown",
+            logger.info("dragonbreath: ignoring target %.1f while Klipper is shutdown",
                         float(degrees))
             return
         self.target = float(degrees)
@@ -549,7 +549,7 @@ class OpenBreath:
         }
 
 
-class OpenBreathSensor:
+class DragonBreathSensor:
     """Klipper sensor interface for heater_generic."""
     def __init__(self, config, module):
         self.printer = config.get_printer()
@@ -579,7 +579,7 @@ class OpenBreathSensor:
         pass
 
 
-class OpenBreathVirtualPin:
+class DragonBreathVirtualPin:
     """Virtual PWM pin that intercepts heater power to sync the target temp."""
     def __init__(self, module):
         self.module = module
@@ -621,4 +621,4 @@ class OpenBreathVirtualPin:
 
 
 def load_config(config):
-    return OpenBreath(config)
+    return DragonBreath(config)

@@ -1,4 +1,4 @@
-# Tests for the OpenBreath HTTP transport's threading contract.
+# Tests for the DragonBreath HTTP transport's threading contract.
 #
 # The bug these guard against: control writes used to run synchronous HTTP on
 # Klipper's reactor thread, so a single SET_HEATER_TEMPERATURE could stall the
@@ -18,7 +18,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import openbreath  # noqa: E402
+import dragonbreath  # noqa: E402
 
 
 def _wait_until(pred, timeout=8.0, interval=0.02):
@@ -31,7 +31,7 @@ def _wait_until(pred, timeout=8.0, interval=0.02):
 
 
 class _MockDevice:
-    """Controllable fake OpenBreath HTTP device."""
+    """Controllable fake DragonBreath HTTP device."""
 
     def __init__(self):
         self.status_body = {"temp": 24.0, "target": 0.0, "heating": False,
@@ -121,7 +121,7 @@ class AsyncTransportTest(unittest.TestCase):
         self.server.server_close()
 
     def _transport(self, poll=0.05, on_message=None, on_disconnect=None):
-        t = openbreath._OpenBreathHTTP(
+        t = dragonbreath._DragonBreathHTTP(
             self.host, self.port, "web",
             on_message or (lambda s: None),
             on_disconnect or (lambda: None),
