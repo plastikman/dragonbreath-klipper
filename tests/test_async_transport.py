@@ -28,7 +28,9 @@ class _MockDevice:
         self.command_fail_times = 0
         self.external_after_command_failure = False
         self.reject_next_power_on = False
+        self.omit_lease_id = False
         self.lease_counter = 0
+        self.active_lease_id = None
         self._requests = []
         self._lock = threading.Lock()
         self.state = self._new_state()
@@ -67,7 +69,6 @@ class _MockDevice:
             "control": {
                 "lease": {
                     "active": False,
-                    "id": None,
                     "owner": None,
                     "expires_in_ms": 0,
                 }
@@ -103,8 +104,9 @@ class _MockDevice:
             self.state["target"]["requested_c"] = 0.0
             self.state["target"]["effective_c"] = 0.0
             self.state["heater"] = {"demand": False, "output": False}
+            self.active_lease_id = None
             self.state["control"]["lease"] = {
-                "active": False, "id": None, "owner": None, "expires_in_ms": 0,
+                "active": False, "owner": None, "expires_in_ms": 0,
             }
 
     def handle_command(self, body):
@@ -137,23 +139,26 @@ class _MockDevice:
                 target = float(body["command"]["target_c"])
                 self.lease_counter += 1
                 lease_id = ("%032x" % self.lease_counter)[-32:]
+                self.active_lease_id = lease_id
                 self.state["mode"] = "power_on"
                 self.state["target"]["requested_c"] = target
                 self.state["target"]["effective_c"] = target
                 self.state["heater"] = {"demand": True, "output": True}
                 self.state["control"]["lease"] = {
                     "active": True,
-                    "id": lease_id,
                     "owner": body["actor"]["id"],
                     "expires_in_ms": 300000,
                 }
             else:
                 self.external_off_locked("klipper", increment=False)
-            return 200, {
+            response = {
                 "ok": True,
                 "request_id": body["request_id"],
                 "state": json.loads(json.dumps(self.state)),
             }
+            if command == "power_on" and not self.omit_lease_id:
+                response["lease_id"] = self.active_lease_id
+            return 200, response
 
     def external_off_locked(self, source, increment=True):
         if increment:
@@ -163,9 +168,15 @@ class _MockDevice:
         self.state["target"]["requested_c"] = 0.0
         self.state["target"]["effective_c"] = 0.0
         self.state["heater"] = {"demand": False, "output": False}
+        self.active_lease_id = None
         self.state["control"]["lease"] = {
-            "active": False, "id": None, "owner": None, "expires_in_ms": 0,
+            "active": False, "owner": None, "expires_in_ms": 0,
         }
+
+    def lease_matches(self, lease_id):
+        with self._lock:
+            return self.active_lease_id is not None \
+                and self.active_lease_id == lease_id
 
 
 def _make_handler(dev):
@@ -212,7 +223,7 @@ def _make_handler(dev):
             elif self.path == "/api/v2/heartbeat":
                 state = dev.snapshot()
                 lease = state["control"]["lease"]
-                if lease["active"] and body.get("lease_id") == lease["id"]:
+                if lease["active"] and dev.lease_matches(body.get("lease_id")):
                     self._json(200, {
                         "ok": True,
                         "state_revision": state["state_revision"],
@@ -306,10 +317,33 @@ class ApiV2TransportTest(unittest.TestCase):
                 "POST", "/api/v2/heartbeat")), timeout=5.0))
         heartbeat = self.dev.requests(
             "POST", "/api/v2/heartbeat")[-1][2]
-        state = self.dev.snapshot()
         self.assertEqual(
-            state["control"]["lease"]["id"], heartbeat["lease_id"])
+            self.dev.active_lease_id, heartbeat["lease_id"])
         self.assertEqual(32, len(heartbeat["lease_id"]))
+        self.assertNotIn(
+            "id", self.dev.snapshot()["control"]["lease"])
+
+    def test_missing_private_lease_fails_safe_and_commands_off(self):
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        off_before = sum(
+            body["command"]["name"] == "off"
+            for _, _, body in self.dev.requests(
+                "POST", "/api/v2/command"))
+        self.dev.omit_lease_id = True
+        transport.set_target(50.0)
+        self.assertTrue(_wait_until(
+            lambda: any(m.get("protocol_error") == "missing_lease_id"
+                        for m in messages), timeout=5.0))
+        self.assertTrue(_wait_until(
+            lambda: sum(
+                body["command"]["name"] == "off"
+                for _, _, body in self.dev.requests(
+                    "POST", "/api/v2/command")) > off_before,
+            timeout=5.0))
+        self.assertIsNone(transport._lease_id)
+        self.assertEqual(0.0, transport._desired_target)
 
     def test_external_off_invalidates_ownership_without_rearm(self):
         messages = []

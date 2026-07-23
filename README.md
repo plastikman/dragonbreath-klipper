@@ -24,10 +24,12 @@ It talks to DragonBreath's HTTP control API over your LAN (no MQTT broker, no cl
   `GET /api/v2/state` polling only as a reconnect fallback. Complete device
   snapshots feed the heater sensor callback on the MCU clock, so
   `verify_heater` still works.
-- An accepted POWER_ON returns a device-issued lease. The helper heartbeats only
-  that exact lease. If a button, WebUI, safety transition, or another controller
-  supersedes it, DragonBreath invalidates the lease and the helper accepts that
-  authoritative state instead of silently restoring its old target.
+- An accepted POWER_ON returns a device-issued lease privately in that
+  authenticated command response. Public state/events expose only lease
+  ownership and expiry metadata. The helper heartbeats only its exact private
+  lease. If a button, WebUI, safety transition, or another controller supersedes
+  it, DragonBreath invalidates the lease and the helper accepts that authoritative
+  state instead of silently restoring its old target.
 - If Klipper crashes/hangs, lease heartbeats stop and DragonBreath's own watchdog
   latches the heater off — **that watchdog, not the OFF request, is the real
   fail-safe.** On orderly disconnect/shutdown the worker also sends an

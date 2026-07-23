@@ -259,6 +259,25 @@ class _DragonBreathHTTP:
         except Exception:
             return False  # retry the same request_id: firmware replay is idempotent
         if 200 <= status < 300:
+            if pending["command"] == "power_on":
+                lease_id = data.get("lease_id")
+                if not isinstance(lease_id, str) or len(lease_id) != 32:
+                    self._accept_state(data.get("state"))
+                    self._notify_protocol_error({
+                        "error": "missing_lease_id",
+                        "message": "POWER_ON response did not include an exact lease",
+                    })
+                    # Fail safe and schedule an unconditional OFF. A successful
+                    # heat command is not owned until its private lease arrives.
+                    with self._state_lock:
+                        self._lease_id = None
+                        self._desired_target = 0.
+                        self._intent_seq += 1
+                        if self._pending is pending:
+                            self._pending = None
+                    return False
+                with self._state_lock:
+                    self._lease_id = lease_id
             self._accept_state(data.get("state"))
             self._applied_target = pending["target"]
             self._applied_seq = pending["seq"]
@@ -347,16 +366,18 @@ class _DragonBreathHTTP:
             old_lease = self._lease_id
             if old is not None and old.get("boot_id") != boot_id:
                 self._lease_id = None
-            active_id = lease.get("id") if lease.get("active") else None
-            if (active_id and self._desired_target > 0.
-                    and lease.get("owner") == self._actor_id
-                    and data.get("source") == "klipper"):
-                self._lease_id = active_id
-            elif self._lease_id and active_id != self._lease_id:
+            owner_matches = bool(
+                lease.get("active")
+                and lease.get("owner") == self._actor_id
+                and data.get("source") == "klipper")
+            owned = bool(
+                self._lease_id
+                and self._desired_target > 0.
+                and owner_matches)
+            if self._lease_id and not owned:
                 self._lease_id = None
                 self._desired_target = 0.
             self._latest_state = data
-            owned = bool(active_id and active_id == self._lease_id)
             countermanded = bool(old_lease and not owned)
 
         flat = self._flatten_state(data)
