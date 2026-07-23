@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install openbreath.py into Klipper's extras directory (symlink) and restart
-# Klipper so the [openbreath] config section becomes available.
+# Install dragonbreath.py into Klipper's extras directory (symlink) and restart
+# Klipper so the [dragonbreath] config section becomes available.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,14 +41,14 @@ if [[ ! -d "$extras_dir" ]]; then
   exit 1
 fi
 
-src="${repo_dir}/openbreath.py"
-dst="${extras_dir}/openbreath.py"
+src="${repo_dir}/dragonbreath.py"
+dst="${extras_dir}/dragonbreath.py"
 
 if [[ $do_copy -eq 1 ]]; then
-  echo "Copying openbreath.py -> ${dst}"
+  echo "Copying dragonbreath.py -> ${dst}"
   cp -f "$src" "$dst"
 else
-  echo "Linking openbreath.py -> ${dst}"
+  echo "Linking dragonbreath.py -> ${dst}"
   ln -sf "$src" "$dst"
 fi
 
@@ -65,12 +65,12 @@ cat <<EOF
 
 Installed. Add to your printer.cfg (see README.md):
 
-  [openbreath]
-  host: <your-openbreath-ip>
+  [dragonbreath]
+  host: <your-dragonbreath-ip>
 
-  [heater_generic openbreath]
-  heater_pin: openbreath:pwm
-  sensor_type: openbreath
+  [heater_generic dragonbreath]
+  heater_pin: dragonbreath:pwm
+  sensor_type: dragonbreath
   control: watermark
   max_delta: 2.0
   min_temp: 0
