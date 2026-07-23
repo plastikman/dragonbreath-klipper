@@ -37,6 +37,7 @@ class _MockDevice:
         self.status_body = {"temp": 24.0, "target": 0.0, "heating": False,
                             "fault": False, "fault_reason": None}
         self.target_delay = 0.0     # seconds the /target handler sleeps
+        self.status_delay = 0.0     # seconds the /status handler sleeps
         self.target_fail_times = 0  # next N /target POSTs answer 500
         self.reflect_target = True  # if True, an accepted /target updates status
         self._requests = []         # (method, path)
@@ -67,6 +68,8 @@ def _make_handler(dev):
         def do_GET(self):
             dev.record("GET", self.path)
             if self.path.startswith("/status"):
+                if dev.status_delay:
+                    time.sleep(dev.status_delay)
                 body = json.dumps(dev.status_body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -217,6 +220,29 @@ class AsyncTransportTest(unittest.TestCase):
                 lambda: len([p for p in self.dev.paths("POST") if p == "/target?t=0"])
                 > n_before, timeout=5.0),
             "force_off did not produce a fresh OFF POST")
+
+    def test_forced_off_not_delayed_by_slow_status(self):
+        # A stalled GET /status must not hold up a forced OFF. The worker asserts
+        # its own desired target (fast-path) BEFORE polling status, so force_off()
+        # reaches /target?t=0 promptly even while /status is timing out. Long poll
+        # so the worker is idle (in its wake-wait) when force_off fires.
+        self.dev.status_delay = 2.0
+        t = self._transport(poll=8.0)
+        t.start()
+        # Initial reconcile posts an OFF; then the first (slow) status runs.
+        self.assertTrue(_wait_until(lambda: "/target?t=0" in self.dev.paths("POST"),
+                                    timeout=3.0))
+        time.sleep(2.3)  # let the first slow /status finish; worker now idle
+        n_before = len([p for p in self.dev.paths("POST") if p == "/target?t=0"])
+        start = time.monotonic()
+        t.force_off()
+        got = _wait_until(
+            lambda: len([p for p in self.dev.paths("POST") if p == "/target?t=0"])
+            > n_before, timeout=1.0)
+        elapsed = time.monotonic() - start
+        self.assertTrue(got, "forced OFF was not delivered")
+        self.assertLess(elapsed, 1.0,
+                        "forced OFF took %.2fs — delayed behind slow /status" % elapsed)
 
     def test_reset_is_enqueued_not_blocking(self):
         self.dev.target_delay = 0.0

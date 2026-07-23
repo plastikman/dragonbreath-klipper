@@ -132,21 +132,24 @@ class _OpenBreathHTTP:
             wrote_ok = True
             try:
                 self._drain_commands()
-                # Poll status FIRST so target reconciliation sees the device's
-                # actually-reported state (target/heating), not a stale guess —
-                # this is what lets us correct uncommanded/external heating.
+                # 1. Fast-path our OWN intent FIRST, before the (possibly slow)
+                #    status poll. This is what makes an explicit or forced OFF land
+                #    promptly instead of waiting out a stalled /status (up to the
+                #    4s HTTP timeout). Passing no device state means this only fires
+                #    when the desired target changed or is unknown (force_off).
+                if not self._sync_target(None, False):
+                    wrote_ok = False
+                # 2. Poll status (may be slow / time out).
                 st = self._get_status()
                 if st is not None:
                     self._on_message(st)
-                    dev_target = st.get("target")
-                    dev_heating = bool(st.get("heating"))
+                    # 3. Reconcile again against the device's REPORTED state, to
+                    #    correct external drift (uncommanded heating, reboot, button,
+                    #    WebUI) that our own-intent fast-path can't see.
+                    if not self._sync_target(st.get("target"), bool(st.get("heating"))):
+                        wrote_ok = False
                 else:
                     self._on_disconnect()
-                    dev_target, dev_heating = None, False
-                    wrote_ok = False
-                # Reconcile the device to the desired target (may POST an OFF even
-                # when we believe we already sent one — see _sync_target).
-                if not self._sync_target(dev_target, dev_heating):
                     wrote_ok = False
                 # Feed the device comms watchdog only while we want heat.
                 if self._desired_target > 0.:
@@ -261,6 +264,9 @@ class _OpenBreathHTTP:
             return True
         except urllib.error.HTTPError as exc:
             # 409 (fault latched / inhibited) and 403 (bad token) are actionable.
+            # HTTPError IS the response object; close it so it doesn't leak a socket
+            # (ResourceWarning) when we don't read/context-manage it.
+            exc.close()
             dt_ms = (time.monotonic() - t0) * 1000.
             logger.warning("openbreath: POST %s -> HTTP %s in %.0fms",
                            path, exc.code, dt_ms)
