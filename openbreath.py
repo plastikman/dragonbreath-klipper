@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 REACTOR_POLL = 1.
 # Warn if no fresh temperature has arrived within this window (s).
 TEMP_STALE_WARN = 30.
+# Warn when a single HTTP request takes at least this long (ms). This is the
+# latency that, on the reactor thread, would starve the MCU command queue and
+# trip "Timer Too Close" — so it is worth flagging even now that all HTTP runs
+# on the worker thread (also useful for chasing the separate Wi-Fi-flap bug).
+HTTP_SLOW_WARN_MS = 1000.
+# Cap the exponential write-retry backoff at poll * 2**this.
+WRITE_BACKOFF_MAX_SHIFT = 3
 
 
 # ─── OpenBreath HTTP transport ────────────────────────────────────────────────
@@ -64,11 +71,20 @@ TEMP_STALE_WARN = 30.
 class _OpenBreathHTTP:
     """Background HTTP client for the OpenBreath control API.
 
-    A daemon thread polls GET /status and hands each reading to on_message().
-    While a positive target is commanded it also POSTs /heartbeat every poll, so
-    the device's comms watchdog stays fed only as long as Klipper is alive — if
-    Klippy crashes/hangs, heartbeats stop and the device latches the heater off.
-    Control writes (set_target) carry the X-OpenBreath-Auth header.
+    A single daemon worker thread is the SOLE owner of every HTTP call — status
+    polls, heartbeats, target writes, and fault resets. The reactor thread never
+    touches the network: it only assigns the desired target (an atomic float
+    write) or enqueues a one-shot command, and pokes a wake Event. This is what
+    keeps Klipper's reactor from blocking on a slow request and tripping "Timer
+    Too Close" mid-print.
+
+    Each cycle the worker: drains queued commands, syncs the device target to the
+    desired target (retrying with backoff until the device accepts it — this is
+    the async, self-healing OFF path), polls GET /status, and — while a positive
+    target is commanded — POSTs /heartbeat so the device's comms watchdog stays
+    fed only as long as Klipper is alive. If Klippy crashes/hangs the heartbeats
+    stop and the device latches the heater off; that watchdog, not the OFF POST,
+    is the real fail-safe. Mutating calls carry the X-OpenBreath-Auth header.
     """
 
     def __init__(self, host, port, token, on_message, on_disconnect, poll):
@@ -79,8 +95,21 @@ class _OpenBreathHTTP:
         self._poll = poll
         self._running = False
         self._thread = None
-        self._last_target = 0.
-        self._io_lock = threading.Lock()
+        # Desired target: written by the reactor thread, read by the worker.
+        # A float load/store is atomic under the GIL, so no lock is needed.
+        self._desired_target = 0.
+        # Last target the device accepted (2xx) — worker-owned. None means the
+        # device's state is unknown (startup, or after a force-off), which forces
+        # the next reconcile to assert the desired target unconditionally. When it
+        # differs from the desired target the worker keeps (re)sending until it
+        # matches. Reconciliation also checks the device's *reported* target, so a
+        # target we never sent (reboot drift, physical button, WebUI) is corrected.
+        self._last_sent_target = None
+        # One-shot commands (e.g. fault reset). deque append/popleft are atomic.
+        self._cmd_queue = collections.deque()
+        # Set by the reactor on any change so the worker acts at once rather than
+        # waiting out a full poll interval.
+        self._wake = threading.Event()
 
     # -- lifecycle --
     def start(self):
@@ -90,41 +119,121 @@ class _OpenBreathHTTP:
         self._thread.start()
 
     def stop(self):
+        # Command the device off and let the worker deliver it before exiting.
+        # If that final OFF never lands, the device's comms watchdog still trips
+        # (heartbeats stop below), so the heater fails safe regardless.
+        self._desired_target = 0.
         self._running = False
+        self._wake.set()
 
     def _run(self):
+        fail_shift = 0
         while self._running:
+            wrote_ok = True
             try:
+                self._drain_commands()
+                # 1. Fast-path our OWN intent FIRST, before the (possibly slow)
+                #    status poll. This is what makes an explicit or forced OFF land
+                #    promptly instead of waiting out a stalled /status (up to the
+                #    4s HTTP timeout). Passing no device state means this only fires
+                #    when the desired target changed or is unknown (force_off).
+                if not self._sync_target(None, False):
+                    wrote_ok = False
+                # 2. Poll status (may be slow / time out).
                 st = self._get_status()
                 if st is not None:
                     self._on_message(st)
-                    if self._last_target > 0.:
-                        self._post("/heartbeat")   # keep the device watchdog fed
+                    # 3. Reconcile again against the device's REPORTED state, to
+                    #    correct external drift (uncommanded heating, reboot, button,
+                    #    WebUI) that our own-intent fast-path can't see.
+                    if not self._sync_target(st.get("target"), bool(st.get("heating"))):
+                        wrote_ok = False
                 else:
                     self._on_disconnect()
+                    wrote_ok = False
+                # Feed the device comms watchdog only while we want heat.
+                if self._desired_target > 0.:
+                    self._post("/heartbeat", quiet=True)
             except Exception as exc:
-                logger.debug("openbreath: poll error: %s", exc)
+                logger.debug("openbreath: worker cycle error: %s", exc)
                 self._on_disconnect()
-            time.sleep(self._poll)
+                wrote_ok = False
+            # Steady poll when in sync; exponential backoff while a needed write
+            # is failing, so a downed device doesn't get hammered.
+            fail_shift = 0 if wrote_ok else min(fail_shift + 1, WRITE_BACKOFF_MAX_SHIFT)
+            delay = self._poll * (1 << fail_shift)
+            if self._wake.wait(timeout=delay):
+                self._wake.clear()
+        # Best-effort final OFF, from the worker thread — never the reactor.
+        try:
+            self._post("/target?t=0")
+        except Exception:
+            pass
 
-    # -- control --
+    # -- control (called on the reactor thread; assign/enqueue only, never I/O) --
     def set_target(self, degrees):
-        degrees = max(0., float(degrees))
-        self._last_target = degrees
-        # A target command also counts as liveness on the device side.
-        self._post("/target?t=%g" % degrees)
+        self._desired_target = max(0., float(degrees))
+        self._wake.set()
 
     def force_off(self):
-        self.set_target(0.)
+        # Unconditionally (re)assert OFF: clearing the confirmed-state cache makes
+        # the next reconcile POST /target?t=0 even if we believe the device is
+        # already at 0. Guarantees connect/disconnect/shutdown force-offs are sent.
+        self._desired_target = 0.
+        self._last_sent_target = None
+        self._wake.set()
 
     def reset_fault(self):
-        self._post("/reset")
+        self._cmd_queue.append("reset")
+        self._wake.set()
+
+    # -- worker-side helpers (all HTTP happens here) --
+    def _drain_commands(self):
+        while True:
+            try:
+                cmd = self._cmd_queue.popleft()
+            except IndexError:
+                break
+            if cmd == "reset":
+                self._post("/reset")
+
+    def _sync_target(self, dev_target, dev_heating):
+        """Reconcile the device to the desired target, POSTing /target when needed.
+
+        Crucially this checks the device's REPORTED state, not just our own last
+        write, so it corrects heating we never commanded — initial force-off,
+        uncommanded heating, device reboot drift, and physical-button / WebUI
+        changes all show up as a device target/heating that disagrees with what we
+        want, and get driven back. A target write also counts as device liveness.
+
+        Returns True if in sync or the write succeeded, False if a needed write
+        failed (so the caller backs off and retries).
+        """
+        desired = self._desired_target
+        need = False
+        if self._last_sent_target is None:
+            need = True                                    # unknown -> assert desired
+        elif dev_target is not None and abs(dev_target - desired) > 0.01:
+            need = True                                    # device diverged from desired
+        elif dev_heating and desired <= 0.:
+            need = True                                    # device hot but we want off
+        elif desired != self._last_sent_target:
+            need = True                                    # desired changed since last send
+        if not need:
+            return True
+        if self._post("/target?t=%g" % desired):
+            self._last_sent_target = desired
+            return True
+        return False
 
     # -- HTTP helpers (stdlib urllib) --
     def _get_status(self):
         req = urllib.request.Request(self._base + "/status", method="GET")
+        t0 = time.monotonic()
         with urllib.request.urlopen(req, timeout=4.) as r:
             raw = r.read()
+        self._log_latency("GET", "/status", (time.monotonic() - t0) * 1000., True,
+                          quiet=True)
         data = json.loads(raw.decode("utf-8", "replace"))
         state = {}
         # OpenBreath emits JSON null for a non-OK sensor; treat that as "no reading"
@@ -140,18 +249,45 @@ class _OpenBreathHTTP:
         state["fault_reason"] = data.get("fault_reason")
         return state
 
-    def _post(self, path):
+    def _post(self, path, quiet=False):
+        """POST to the device. Returns True on 2xx, False otherwise. Never raises
+        (all HTTP lives on the worker thread; failures must not escape)."""
         req = urllib.request.Request(
             self._base + path, data=b"", method="POST",
             headers={"X-OpenBreath-Auth": self._token})
-        with self._io_lock:
-            try:
-                with urllib.request.urlopen(req, timeout=4.) as r:
-                    r.read()
-            except urllib.error.HTTPError as exc:
-                # 409 (fault latched / inhibited) and 403 (bad token) are actionable
-                # — surface them; other errors bubble to the poll loop's handler.
-                logger.warning("openbreath: POST %s -> HTTP %s", path, exc.code)
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=4.) as r:
+                r.read()
+            self._log_latency("POST", path, (time.monotonic() - t0) * 1000., True,
+                              quiet=quiet)
+            return True
+        except urllib.error.HTTPError as exc:
+            # 409 (fault latched / inhibited) and 403 (bad token) are actionable.
+            # HTTPError IS the response object; close it so it doesn't leak a socket
+            # (ResourceWarning) when we don't read/context-manage it.
+            exc.close()
+            dt_ms = (time.monotonic() - t0) * 1000.
+            logger.warning("openbreath: POST %s -> HTTP %s in %.0fms",
+                           path, exc.code, dt_ms)
+            return False
+        except Exception as exc:
+            dt_ms = (time.monotonic() - t0) * 1000.
+            logger.debug("openbreath: POST %s failed in %.0fms: %s", path, dt_ms, exc)
+            return False
+
+    def _log_latency(self, method, path, dt_ms, ok, quiet=False):
+        # A slow request is always worth a WARN — it is exactly the latency that
+        # would have starved the MCU queue back when this ran on the reactor.
+        if dt_ms >= HTTP_SLOW_WARN_MS:
+            logger.warning("openbreath: %s %s -> %s in %.0fms (slow)",
+                           method, path, "ok" if ok else "fail", dt_ms)
+        elif quiet:
+            logger.debug("openbreath: %s %s -> %s in %.0fms",
+                         method, path, "ok" if ok else "fail", dt_ms)
+        else:
+            logger.info("openbreath: %s %s -> %s in %.0fms",
+                        method, path, "ok" if ok else "fail", dt_ms)
 
 
 # ─── Klipper heater module ────────────────────────────────────────────────────
@@ -178,7 +314,8 @@ class OpenBreath:
 
         # State (owned by the reactor thread).
         self.temperature = 0.
-        self.target = 0.
+        self.target = 0.           # target Klipper wants (desired)
+        self.device_target = 0.    # target the device reports (confirmed)
         self.smoothed_temp = 0.
         self.is_connected = False
         self.device_heating = False
@@ -337,6 +474,8 @@ class OpenBreath:
                 self._last_temp_time = eventtime
             if data.get("ptc") is not None:
                 self.ptc_temp = float(data["ptc"])
+            if data.get("target") is not None:
+                self.device_target = float(data["target"])
             self.device_heating = bool(data.get("heating"))
             self.device_fault = bool(data.get("fault"))
             self.fault_reason = data.get("fault_reason")
@@ -400,6 +539,7 @@ class OpenBreath:
         return {
             "temperature": self.temperature,
             "target": self.target,
+            "device_target": self.device_target,
             "smoothed_temp": self.smoothed_temp,
             "connected": self.is_connected,
             "heating": self.device_heating,
