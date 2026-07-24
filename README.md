@@ -23,7 +23,8 @@ It talks to DragonBreath's HTTP control API over your LAN (no MQTT broker, no cl
 - The helper consumes `GET /api/v2/events` (SSE) and uses serialized
   `GET /api/v2/state` polling only as a reconnect fallback. Complete device
   snapshots feed the heater sensor callback on the MCU clock, so
-  `verify_heater` still works.
+  `verify_heater` still works. If the device's limited SSE slots are busy,
+  reconnect attempts back off while state polling continues.
 - An accepted POWER_ON returns a device-issued lease privately in that
   authenticated command response. Public state/events expose only lease
   ownership and expiry metadata. The helper heartbeats only its exact private

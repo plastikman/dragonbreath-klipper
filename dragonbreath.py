@@ -1,6 +1,6 @@
 # dragonbreath.py — Klipper extras module for the DragonBreath chamber heater.
 #
-# Surfaces an DragonBreath-firmware Panda Breath as a standard Klipper heater
+# Surfaces a DragonBreath-firmware Panda Breath as a standard Klipper heater
 # (heater_generic interface), so it shows up in Fluidd/Mainsail as a chamber
 # heater with a live temperature and a settable target, and can be driven with
 # M141 / M191.
@@ -63,6 +63,10 @@ TEMP_STALE_WARN = 30.
 HTTP_SLOW_WARN_MS = 1000.
 # Cap the exponential write-retry backoff at poll * 2**this.
 WRITE_BACKOFF_MAX_SHIFT = 3
+# A busy SSE endpoint is expected when its two client slots are occupied. Keep
+# polling state, but back SSE reconnects off instead of logging a 503 every second.
+SSE_BACKOFF_MAX_SHIFT = 6
+SSE_BACKOFF_MAX_SECONDS = 30.
 API_VERSION = 2
 HEARTBEAT_INTERVAL = 30.
 
@@ -102,6 +106,7 @@ class _DragonBreathHTTP:
         self._applied_target = None
         self._cmd_queue = collections.deque()
         self._wake = threading.Event()
+        self._event_stop = threading.Event()
         self._last_protocol_error = None
 
     # -- lifecycle --
@@ -109,6 +114,7 @@ class _DragonBreathHTTP:
         if self._running:
             return
         self._running = True
+        self._event_stop.clear()
         self._event_thread = threading.Thread(
             target=self._event_run, name="dragonbreath_events", daemon=True)
         self._thread = threading.Thread(
@@ -123,6 +129,7 @@ class _DragonBreathHTTP:
             self._lease_id = None
         self._running = False
         self._wake.set()
+        self._event_stop.set()
 
     def _run(self):
         fail_shift = 0
@@ -435,7 +442,9 @@ class _DragonBreathHTTP:
 
     # -- SSE observer with polling fallback in the command worker --
     def _event_run(self):
+        fail_shift = 0
         while self._running:
+            received_state = False
             try:
                 req = urllib.request.Request(
                     self._base + "/api/v2/events", method="GET",
@@ -452,6 +461,8 @@ class _DragonBreathHTTP:
                                 state = json.loads("\n".join(data_lines))
                                 if self._accept_state(state):
                                     self._event_live = True
+                                    received_state = True
+                                    fail_shift = 0
                                 data_lines = []
                             continue
                         if line.startswith("data:"):
@@ -466,7 +477,13 @@ class _DragonBreathHTTP:
                 self._event_live = False
             if self._running:
                 self._wake.set()  # command worker begins polling immediately
-                time.sleep(min(1., self._poll))
+                if not received_state:
+                    fail_shift = min(
+                        fail_shift + 1, SSE_BACKOFF_MAX_SHIFT)
+                delay = min(
+                    SSE_BACKOFF_MAX_SECONDS,
+                    float(1 << max(0, fail_shift - 1)))
+                self._event_stop.wait(delay)
 
     # -- HTTP helpers (stdlib urllib; never called by the reactor) --
     def _request_json(self, method, path, body=None, quiet=False):
