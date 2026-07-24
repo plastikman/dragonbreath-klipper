@@ -297,6 +297,30 @@ class ApiV2TransportTest(unittest.TestCase):
             lambda: any(m.get("temperature") == 24.0 for m in messages),
             timeout=5.0))
 
+    def test_busy_sse_backs_off_while_state_polling_continues(self):
+        transport = self.transport(poll=0.05)
+        transport.start()
+        self.assertTrue(_wait_until(
+            lambda: len(self.dev.requests("GET", "/api/v2/events")) >= 2,
+            timeout=2.0))
+        time.sleep(1.25)
+        event_requests = len(
+            self.dev.requests("GET", "/api/v2/events"))
+        state_requests = len(
+            self.dev.requests("GET", "/api/v2/state"))
+        self.assertLessEqual(event_requests, 3)
+        self.assertGreater(state_requests, event_requests)
+
+    def test_stop_interrupts_sse_backoff(self):
+        transport = self.transport(poll=0.05)
+        transport.start()
+        self.assertTrue(_wait_until(
+            lambda: len(self.dev.requests("GET", "/api/v2/events")) >= 2,
+            timeout=2.0))
+        transport.stop()
+        transport._event_thread.join(timeout=0.5)
+        self.assertFalse(transport._event_thread.is_alive())
+
     def test_retry_reuses_request_id(self):
         transport = self.transport()
         self.wait_initial_off(transport)
