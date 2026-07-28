@@ -104,6 +104,10 @@ class _DragonBreathHTTP:
         self._applied_seq = -1
         self._pending = None
         self._applied_target = None
+        # Manual filtration blower (fan-only). Reactor writes _desired_fan; the
+        # worker reconciles it via the idempotent, revision-free `filter` command.
+        self._desired_fan = 0
+        self._last_sent_fan = 0     # device boots fan-off; matches _desired_fan
         self._cmd_queue = collections.deque()
         self._wake = threading.Event()
         self._event_stop = threading.Event()
@@ -125,6 +129,7 @@ class _DragonBreathHTTP:
     def stop(self):
         with self._state_lock:
             self._desired_target = 0.
+            self._desired_fan = 0
             self._intent_seq += 1
             self._lease_id = None
         self._running = False
@@ -140,9 +145,16 @@ class _DragonBreathHTTP:
                 if self._latest_state is None:
                     self._handshake()
                     self._get_state()
+                    # Fresh (re)connect: the device booted OFF with the fan off, so
+                    # its fan is known-0. Setting last_sent to 0 (not None) avoids a
+                    # spurious filter{0} on every connect, yet still re-asserts a
+                    # non-zero desired fan on the next _sync_fan().
+                    self._last_sent_fan = 0
                 if not self._drain_commands():
                     cycle_ok = False
                 if not self._sync_intent():
+                    cycle_ok = False
+                if not self._sync_fan():
                     cycle_ok = False
                 if not self._event_live:
                     self._get_state()
@@ -187,6 +199,13 @@ class _DragonBreathHTTP:
             self._intent_seq += 1
             self._pending = None
             self._lease_id = None
+        self._wake.set()
+
+    def set_fan(self, percent):
+        # Reactor-thread entry: record fan-only filtration intent, wake the worker.
+        # No I/O here — same discipline as set_target (never block the reactor).
+        with self._state_lock:
+            self._desired_fan = max(0, min(100, int(percent)))
         self._wake.set()
 
     def reset_fault(self):
@@ -302,6 +321,30 @@ class _DragonBreathHTTP:
                     self._lease_id = None
                 if self._pending is pending:
                     self._pending = None
+            return True
+        return False
+
+    def _sync_fan(self):
+        # Reconcile the fan-only filtration blower to the reactor's desired level.
+        # The `filter` command is safe (no heat), idempotent, and revision-free, so
+        # this needs no lease/revision handshake — send only when it changed.
+        with self._state_lock:
+            desired = self._desired_fan
+        if desired == self._last_sent_fan:
+            return True
+        try:
+            status, data = self._send_command(
+                "filter", {"percent": desired}, None, uuid.uuid4().hex, quiet=True)
+        except Exception:
+            return False  # retry next cycle; idempotent
+        if 200 <= status < 300:
+            self._accept_state(data.get("state"))
+            self._last_sent_fan = desired
+            return True
+        if status in (400, 403, 409):
+            self._accept_state(data.get("state"))
+            self._notify_protocol_error(data)
+            self._last_sent_fan = desired  # explicit rejection is terminal; don't spin
             return True
         return False
 
@@ -586,6 +629,7 @@ class DragonBreath:
 
         self._sensor = None
         self._virtual_pin = None
+        self._fan_pin = None
         self._heater = None
         self._heater_set_temp_orig = None
         self._state_queue = collections.deque()
@@ -626,6 +670,12 @@ class DragonBreath:
         if pin_params['pin'] == 'pwm':
             self._virtual_pin = DragonBreathVirtualPin(self)
             return self._virtual_pin
+        if pin_params['pin'] == 'filter':
+            # Fan-only filtration blower, e.g. a binary [output_pin
+            # dragonbreath_filter] with `pin: dragonbreath:filter`. On/off only
+            # (the blower can't modulate) — never drives the heater.
+            self._fan_pin = DragonBreathFanPin(self)
+            return self._fan_pin
         raise self.printer.config.error(
             "Unknown dragonbreath pin: %s" % (pin_params['pin'],))
 
@@ -821,6 +871,12 @@ class DragonBreath:
         self.target = float(degrees)
         self._transport.set_target(degrees)
 
+    def set_fan_percent(self, percent):
+        # Fan-only filtration; independent of the heater, safe to run any time
+        # (including while shutdown — it never adds heat). Reactor-thread safe:
+        # the transport only records intent and wakes its worker.
+        self._transport.set_fan(percent)
+
     def get_status(self, eventtime):
         return {
             "temperature": self.temperature,
@@ -915,6 +971,46 @@ class DragonBreathVirtualPin:
         except Exception:
             pass
         return None
+
+    def setup_max_duration(self, max_duration):
+        pass
+
+    def setup_cycle_time(self, cycle_time, shutdown_value=0.):
+        pass
+
+    def setup_start_value(self, start_value, shutdown_value):
+        pass
+
+
+class DragonBreathFanPin:
+    """Virtual pin exposing the chamber blower for fan-only filtration, e.g.
+    `[output_pin dragonbreath_filter] pin: dragonbreath:filter`. The hardware
+    blower is strictly on/off (a zero-cross TRIAC, never phase-chopped), so this is
+    a BINARY output — a digital toggle, not a PWM slider. It never drives the
+    heater; it maps on/off to the device's out-of-band `filter` command.
+
+    `set_digital` is the digital-out path (a binary `[output_pin]`); `set_pwm` is
+    kept as a fallback so the pin still works if bound to a PWM consumer, treating
+    any non-zero duty as full-on."""
+    def __init__(self, module):
+        self.module = module
+        self.last_value = 0.0
+
+    def get_mcu(self):
+        return self.module.printer.lookup_object('mcu')
+
+    def _apply(self, value):
+        # Reactor thread. Act only on an on<->off transition; the module hands
+        # intent to the transport worker — no I/O on the reactor thread.
+        if (self.last_value > 0.) != (value > 0.):
+            self.module.set_fan_percent(100 if value > 0. else 0)
+        self.last_value = value
+
+    def set_digital(self, print_time, value):
+        self._apply(value)
+
+    def set_pwm(self, print_time, value, cycle_time=None):
+        self._apply(value)
 
     def setup_max_duration(self, max_duration):
         pass
