@@ -126,8 +126,9 @@ class _MockDevice:
                     "error": "revision_conflict",
                     "state": json.loads(json.dumps(self.state)),
                 }
-            if command != "off" and body.get("expected_revision") != \
-                    self.state["state_revision"]:
+            # `off` and `filter` are ungated in the firmware (safe, revision-free).
+            if command not in ("off", "filter") and \
+                    body.get("expected_revision") != self.state["state_revision"]:
                 return 409, {
                     "ok": False,
                     "error": "revision_conflict",
@@ -135,6 +136,16 @@ class _MockDevice:
                 }
             self.state["state_revision"] += 1
             self.state["source"] = "klipper"
+            if command == "filter":
+                pct = int(body["command"].get("percent", 0))
+                self.state["fan"]["requested_percent"] = pct
+                self.state["fan"]["effective_percent"] = pct
+                self.state["fan"]["reason"] = "requested" if pct else "off"
+                return 200, {
+                    "ok": True,
+                    "request_id": body["request_id"],
+                    "state": json.loads(json.dumps(self.state)),
+                }
             if command == "power_on":
                 target = float(body["command"]["target_c"])
                 self.lease_counter += 1
@@ -278,6 +289,39 @@ class ApiV2TransportTest(unittest.TestCase):
             self.dev.requests("POST", "/api/v2/command")
             if body["command"]["name"] == "power_on"
         ]
+
+    def filter_commands(self):
+        return [
+            body for _, _, body in
+            self.dev.requests("POST", "/api/v2/command")
+            if body["command"]["name"] == "filter"
+        ]
+
+    def test_filter_fan_on_off_revision_free_and_idempotent(self):
+        transport = self.transport()
+        self.wait_initial_off(transport)
+        # No spurious filter command on a fresh connect (desired fan == 0).
+        time.sleep(0.15)
+        self.assertEqual([], self.filter_commands())
+        # Turn the blower on: one filter{100}, carrying NO expected_revision
+        # (the firmware treats filter as safe/ungated).
+        transport.set_fan(100)
+        self.assertTrue(_wait_until(
+            lambda: any(b["command"].get("percent") == 100
+                        for b in self.filter_commands()), timeout=5.0))
+        for b in self.filter_commands():
+            self.assertNotIn("expected_revision", b)
+        # Idempotent: repeating the same intent does not re-send.
+        transport.set_fan(100)
+        time.sleep(0.2)
+        self.assertEqual(1, len([b for b in self.filter_commands()
+                                 if b["command"].get("percent") == 100]))
+        # Turn it off and confirm the device state followed.
+        transport.set_fan(0)
+        self.assertTrue(_wait_until(
+            lambda: self.dev.state["fan"]["requested_percent"] == 0
+                    and any(b["command"].get("percent") == 0
+                            for b in self.filter_commands()), timeout=5.0))
 
     def test_set_target_is_nonblocking(self):
         transport = self.transport()
