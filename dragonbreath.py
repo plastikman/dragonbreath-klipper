@@ -45,12 +45,28 @@ import json
 import logging
 import threading
 import time
-import urllib.request
-import urllib.error
 import collections
-import uuid
 
 logger = logging.getLogger(__name__)
+
+# Deferred until a DragonBreath is actually configured. Kalico imports every
+# module in klippy/extras at startup, whether or not a config section
+# references it, so anything at module scope is paid for by every printer
+# running the firmware. urllib.request is the expensive one: it pulls in ssl,
+# http.client, email and ipaddress, ~57 modules and a few MB of interpreter
+# heap. Printers with no DragonBreath now pay only this module's bytecode.
+urllib = None
+uuid = None
+
+
+def _ensure_runtime_imports():
+    global urllib, uuid
+    if urllib is not None:
+        return
+    import urllib.error
+    import urllib.request
+    import uuid
+
 
 # How often the reactor timer drains the state queue + syncs the target (s).
 REACTOR_POLL = 1.
@@ -85,6 +101,7 @@ class _DragonBreathHTTP:
     """
 
     def __init__(self, host, port, token, on_message, on_disconnect, poll):
+        _ensure_runtime_imports()
         self._base = "http://%s:%d" % (host, port)
         self._token = token
         self._on_message = on_message
