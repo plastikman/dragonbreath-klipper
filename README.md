@@ -106,4 +106,5 @@ safety limits (over-temp cutoffs, comms watchdog, target clamp). Read the
 DragonBreath `docs/SAFETY.md`. The heater is mains-powered — supervise it.
 
 ## Credits
-Klipper integration derived from Justin Hayes' pandabreath-klipper. MIT licensed.
+Klipper integration derived from Justin Hayes' pandabreath-klipper. Licensed under
+GPL-3.0 (like Klipper and the upstream project — see [LICENSE](LICENSE)).
