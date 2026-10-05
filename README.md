@@ -75,6 +75,51 @@ heating_gain: 1
 ```
 The `[dragonbreath]` name and the `[heater_generic dragonbreath]` name must match.
 
+This config is **printer-agnostic** — it works on any Klipper machine (Voron,
+RatRig, a stock printer, the Snapmaker U1/PAXX, …), since the helper talks to the
+DragonBreath device over the LAN, not to the printer's MCU. The only printer the
+`[dragonbreath]` + `[heater_generic]` sections must *not* be duplicated on is one
+whose firmware already ships them (e.g. the Snapmaker U1/PAXX managed config) —
+there, include them once.
+
+### Chamber macros (M141 / M191)
+`M141` (set chamber) and `M191` (set + wait) are not native Klipper. With
+`register_macros: True` (the default) the module registers both for you:
+- `M141 S<t>` — set the chamber target (`S0` = off), returns immediately.
+- `M191 S<t>` — set the target and **block until the chamber reaches `S`**.
+
+To define your own instead — e.g. to add a **release tolerance** so a slow PTC
+chamber's on/off undershoot can't hang the wait forever, or on a printer that
+already defines these commands — set `register_macros: False` and add:
+
+```ini
+[gcode_macro M141]
+description: Set Chamber Temperature
+gcode:
+    {% set s = params.S|default(0)|float %}
+    SET_HEATER_TEMPERATURE HEATER="dragonbreath" TARGET={s}
+
+[gcode_macro M191]
+description: Wait for Chamber Temperature (R = release temp, defaults to S-5)
+gcode:
+    {% set s = params.S|default(0)|float %}
+    {% set r = params.R|default(0)|float %}
+    {% if r <= 0 %}{% set r = s - 5 %}{% endif %}
+    {% set r = [r, s]|min %}
+    M141 S{s}
+    TEMPERATURE_WAIT SENSOR="heater_generic dragonbreath" MINIMUM={r}
+```
+
+`M191` here starts the heater (`M141 S`) and waits until the `heater_generic
+dragonbreath` sensor reaches `R`, the **release temperature** — default `S-5`,
+clamped so it can never exceed `S`. The small margin releases the print once the
+chamber is *near* target instead of stalling if it asymptotes a degree or two
+short. Pass `R` explicitly to override (e.g. `M191 S55 R52`). `M191 S0` turns the
+heater off and returns immediately. Note the sensor is the DragonBreath device's
+own NTC (in the heater outlet, so it reads a little ahead of the bulk chamber) —
+for a guaranteed bulk-chamber **soak**, follow the wait with a timed dwell (`G4`)
+or a soak macro in your print-start sequence.
+
 ## Usage
 - **Fluidd/Mainsail:** the `dragonbreath` heater appears with the other heaters —
   set the target from its card.
