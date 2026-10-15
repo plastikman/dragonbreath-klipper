@@ -1,6 +1,6 @@
 # dragonbreath-klipper
 
-Klipper `extras` module that surfaces an **[DragonBreath](https://github.com/plastikman/DragonBreath)**-firmware
+Klipper integration that surfaces an **[DragonBreath](https://github.com/plastikman/DragonBreath)**-firmware
 BIGTREETECH Panda Breath as a standard chamber heater — live temperature + a
 settable target in **Fluidd/Mainsail**, driven with **M141 / M191**.
 
@@ -47,8 +47,27 @@ git clone https://github.com/plastikman/dragonbreath-klipper
 cd dragonbreath-klipper
 ./install.sh
 ```
-`install.sh` symlinks `dragonbreath.py` into `~/klipper/klippy/extras/` and restarts
-Klipper. Add the Moonraker update-manager block below to get updates in Fluidd.
+`install.sh` installs the standard Klipper `extras` version by symlinking
+`dragonbreath.py` into `~/klipper/klippy/extras/`, then restarts Klipper. For
+Kalico, use the plugin installation below instead. Install the integration by
+one method only.
+
+### Kalico plugin install
+Kalico discovers plugin packages under `~/klipper/klippy/plugins/`. The local
+folder name must be `dragonbreath` so it matches the existing `[dragonbreath]`
+config section. The GitHub repository can keep its `dragonbreath-klipper` name;
+the final argument below sets the local folder name:
+
+```bash
+mkdir -p ~/klipper/klippy/plugins
+git clone https://github.com/plastikman/dragonbreath-klipper.git ~/klipper/klippy/plugins/dragonbreath
+sudo systemctl restart klipper
+```
+
+Keep the same `[dragonbreath]` and `[heater_generic dragonbreath]` configuration
+shown below. To receive updates through Moonraker, use the Kalico install path
+in the update-manager block below. If your Klipper checkout is not at
+`~/klipper`, replace that path with its actual location.
 
 ## Configuration
 ```ini
@@ -136,10 +155,12 @@ macros/dashboards: `heating`, `fault`, `inhibited`, `fault_reason`, `ptc_temp`,
 `device_moonraker_connected`, and `protocol_error`.
 
 ## Moonraker update manager
+For the standard `install.sh` installation, use `path: ~/dragonbreath-klipper`.
+For Kalico, use the plugin path shown here:
 ```ini
 [update_manager dragonbreath-klipper]
 type: git_repo
-path: ~/dragonbreath-klipper
+path: ~/klipper/klippy/plugins/dragonbreath
 origin: https://github.com/plastikman/dragonbreath-klipper.git
 primary_branch: main
 managed_services: klipper
