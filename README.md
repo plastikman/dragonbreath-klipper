@@ -24,7 +24,8 @@ It talks to DragonBreath's HTTP control API over your LAN (no MQTT broker, no cl
   `GET /api/v2/state` polling only as a reconnect fallback. Complete device
   snapshots feed the heater sensor callback on the MCU clock, so
   `verify_heater` still works. If the device's limited SSE slots are busy,
-  reconnect attempts back off while state polling continues.
+  reconnect attempts back off while state polling continues, and a sustained
+  busy stream is logged once at INFO.
 - An accepted POWER_ON returns a device-issued lease privately in that
   authenticated command response. Public state/events expose only lease
   ownership and expiry metadata. The helper heartbeats only its exact private
@@ -78,6 +79,7 @@ host: 10.168.2.53          # DragonBreath device IP or hostname (dragonbreath.lo
                            # a control token on the device (NVS ctl_token); then match it.
 #poll_interval: 2.0        # API v2 polling fallback / retry base interval
 #register_macros: True     # register M141/M191 (set False if you define your own)
+#m191_on_rejection: wait   # wait | continue - M191 after a refused/overridden target
 
 [heater_generic dragonbreath]
 heater_pin: dragonbreath:pwm
@@ -152,7 +154,82 @@ Extra authoritative status is exposed on the `dragonbreath` printer object for
 macros/dashboards: `heating`, `fault`, `inhibited`, `fault_reason`, `ptc_temp`,
 `connected`, `mode`, `source`, `state_revision`, `firmware_version`,
 `lease_owner`, `lease_owned`, `heater_demand`, `fan_percent`, `fan_reason`,
-`device_moonraker_connected`, and `protocol_error`.
+`device_moonraker_connected`, and `event_stream_live` (false while the helper
+is polling because the SSE stream is unavailable).
+
+### When the device refuses a target
+The device rejects a heat command whose `expected_revision` is stale. Its own
+policy also advances the revision (AUTO engage, the fan-only filtration band
+following the bed setpoint), so `M140` right before `M141` can race it. When the
+fresh state shows nobody countermanded the request (same mode, target and
+source, no other lease holder, no fault), the helper re-sends the same target
+with the fresh revision, up to twice. A watchdog timer edge that leaves the
+device idle (a local run or drying cycle ending) is retried too, unless the lease
+that expired was Klipper's own. A button, WebUI or safety change is final, as is
+any other rejection (`fault_latched`, `inhibited`, ...). These rules rely on how
+the firmware stamps `source` on each revision, verified against DragonBreath
+firmware v1.1.18 (API v2); other builds should be checked against them.
+
+A final rejection, or a button/WebUI countermand, sets the Klipper target to 0
+and prints one console line. A rejected heat command stays in status until the
+next target is set; a fan or handshake rejection clears on the next good state
+or fan request:
+
+| field | meaning |
+|-------|---------|
+| `protocol_error` | firmware error code (`revision_conflict`, `fault_latched`, ...) or `null` |
+| `protocol_error_code` | stable reason: `countermanded`, `conflict_retries_exhausted`, `fault_latched`, `inhibited`, `invalid_command`, `auth_failed`, `missing_lease_id`, `lease_lost`, `heater_busy`, or another firmware code |
+| `protocol_error_message` | firmware message text, or `null` |
+| `protocol_error_target` | the target (C) the rejected request asked for, or `null` |
+| `protocol_error_seq` | counts rejections since Klipper started; never resets |
+
+Neither `M141` nor `M191` raises on a rejection. `M191` never treats a zeroed
+target as reached: it keeps waiting until the chamber reaches its `S` value,
+whatever heats it (a retry such as `dragonbreath/set_target`, or the heater
+turned back on at the box). It also stops waiting when a target of 0 is set, the
+print is cancelled (`pause_resume:cancel`, which Mainsail, Fluidd and HelixScreen
+Cancel send, or a Kalico `HEATER_INTERRUPT`), or Klipper shuts down. There is no
+timeout and no automatic pause. While it waits it holds the G-code lock, so
+console commands (including `CANCEL_PRINT` and `RESTART`) queue until it ends;
+the console warning says so and lists the ways out.
+
+`m191_on_rejection` chooses this behaviour:
+
+- `wait` (default): M191 holds the print as described above. The trade-off is
+  that it holds the G-code lock, so the only ways out are the chamber reaching
+  temperature, a Cancel from the printer UI (`printer.print.cancel`), an
+  emergency stop, or `dragonbreath/set_target`.
+- `continue`: M191 returns as soon as its target is zeroed, like Klipper's own
+  heater wait, and the print carries on with the chamber unheated. A slicer
+  `TEMPERATURE_WAIT` on the chamber sensor can then hang the print instead.
+
+While `M191` waits, the `dragonbreath` object reports `wait_active: true` and
+`wait_target` (the temperature it is holding for, following a newer target set
+during the wait); both reset when the wait ends, however it ends. Like stock
+`M109`/`M190`, the wait prints the heaters' temperature report line once a second.
+
+### `dragonbreath/set_target` (Moonraker / API)
+Moonraker publishes the klippy endpoint as JSON-RPC
+`printer.dragonbreath.set_target` and HTTP `POST /printer/dragonbreath/set_target`:
+```json
+{"jsonrpc": "2.0", "method": "printer.dragonbreath.set_target",
+ "params": {"target": 60}, "id": 1}
+```
+Applies the target exactly as `M141` does and answers once the device decides
+(at most 5 s). It runs on the reactor, so it works while a print is blocked in
+`M191`/`TEMPERATURE_WAIT`. Response:
+
+| field | meaning |
+|-------|---------|
+| `accepted` | `true`, `false`, or `null` while `pending` |
+| `pending` | `true` if the device had not answered within 5 s |
+| `reason` | `null` when accepted; else a `protocol_error_code` value, `superseded` (a newer target replaced it) or `klipper_shutdown` |
+| `seq` | intent sequence number of this request |
+| `target` | the target that was requested |
+
+`target` must be a JSON number (a quoted string is refused by Klipper).
+A target outside the heater's `min_temp`/`max_temp` returns an error, as does a
+request before Klipper has connected the heater hook (the target was not sent).
 
 ## Moonraker update manager
 For the standard `install.sh` installation, use `path: ~/dragonbreath-klipper`.
