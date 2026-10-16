@@ -120,6 +120,29 @@ or fan request:
 
 `M141` never raises on a rejection.
 
+### `dragonbreath/set_target` (Moonraker / API)
+Moonraker publishes the klippy endpoint as JSON-RPC
+`printer.dragonbreath.set_target` and HTTP `POST /printer/dragonbreath/set_target`:
+```json
+{"jsonrpc": "2.0", "method": "printer.dragonbreath.set_target",
+ "params": {"target": 60}, "id": 1}
+```
+Applies the target exactly as `M141` does and answers once the device decides
+(at most 5 s). It runs on the reactor, so it works while a print is blocked in
+`M191`/`TEMPERATURE_WAIT`. Response:
+
+| field | meaning |
+|-------|---------|
+| `accepted` | `true`, `false`, or `null` while `pending` |
+| `pending` | `true` if the device had not answered within 5 s |
+| `reason` | `null` when accepted; else a `protocol_error_code` value, `superseded` (a newer target replaced it) or `klipper_shutdown` |
+| `seq` | intent sequence number of this request |
+| `target` | the target that was requested |
+
+`target` must be a JSON number (a quoted string is refused by Klipper).
+A target outside the heater's `min_temp`/`max_temp` returns an error, as does a
+request before Klipper has connected the heater hook (the target was not sent).
+
 ## Moonraker update manager
 ```ini
 [update_manager dragonbreath-klipper]

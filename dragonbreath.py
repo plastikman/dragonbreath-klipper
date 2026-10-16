@@ -92,6 +92,9 @@ HEARTBEAT_INTERVAL = 30.
 CONFLICT_RETRY_MAX = 2
 # Intent outcomes kept for intent_result(); older seqs read as superseded.
 INTENT_RESULTS_KEPT = 16
+# How long dragonbreath/set_target waits for the device to accept or reject (s).
+SET_TARGET_WAIT = 5.
+SET_TARGET_POLL = 0.1
 
 
 # ─── DragonBreath HTTP transport ────────────────────────────────────────────────
@@ -841,6 +844,11 @@ class DragonBreath:
                                    desc="Set chamber temperature (DragonBreath)")
             gcode.register_command("M191", self._cmd_M191,
                                    desc="Set chamber temperature and wait (DragonBreath)")
+        # Webhooks run on the reactor, so this works while a gcode wait holds
+        # the gcode mutex (e.g. a print stuck in TEMPERATURE_WAIT).
+        webhooks = self.printer.lookup_object('webhooks')
+        webhooks.register_endpoint("dragonbreath/set_target",
+                                   self._handle_set_target)
 
     def _create_sensor(self, config):
         self._sensor = DragonBreathSensor(config, self)
@@ -935,6 +943,47 @@ class DragonBreath:
                 raise gcmd.error("dragonbreath: heater '%s' not found — is "
                                  "[heater_generic %s] configured?" % (self.name, self.name))
         pheaters.set_temperature(heater, temp, wait)
+
+    def _handle_set_target(self, web_request):
+        target = web_request.get_float('target')
+        if target < 0.:
+            raise self.printer.command_error("target must be >= 0")
+        if self._in_shutdown and target > 0.:
+            web_request.send({"accepted": False, "pending": False,
+                              "reason": "klipper_shutdown", "seq": None,
+                              "target": target})
+            return
+        pheaters = self.printer.lookup_object('heaters')
+        heater = self._heater
+        if heater is None:
+            try:
+                heater = pheaters.lookup_heater(self.name)
+            except Exception:
+                raise self.printer.command_error(
+                    "dragonbreath: heater '%s' not found" % (self.name,))
+        seq_before = self._intent_seq
+        # Same path as M141, so anything Klipper records for a heater target
+        # (e.g. power-loss recovery) sees it; the wrapped hook sends it.
+        pheaters.set_temperature(heater, target, False)
+        if self._intent_seq == seq_before:
+            raise self.printer.command_error(
+                "dragonbreath: target not sent; the heater hook is not attached")
+        seq = self._intent_seq
+        deadline = self.reactor.monotonic() + SET_TARGET_WAIT
+        result = self._transport.intent_result(seq)
+        while result is None:
+            now = self.reactor.monotonic()
+            if now >= deadline:
+                break
+            self.reactor.pause(min(deadline, now + SET_TARGET_POLL))
+            result = self._transport.intent_result(seq)
+        if result is None:
+            web_request.send({"accepted": None, "pending": True,
+                              "reason": None, "seq": seq, "target": target})
+            return
+        web_request.send({"accepted": bool(result["accepted"]),
+                          "pending": False, "reason": result["reason"],
+                          "seq": seq, "target": target})
 
     def _cmd_reset(self, gcmd):
         try:

@@ -99,6 +99,14 @@ class FakeGcode:
         self.responses.append(msg)
 
 
+class FakeWebhooks:
+    def __init__(self):
+        self.endpoints = {}
+
+    def register_endpoint(self, path, callback):
+        self.endpoints[path] = callback
+
+
 class FakePrinter:
     command_error = CommandError
 
@@ -106,11 +114,13 @@ class FakePrinter:
         self.reactor = FakeReactor()
         self.heaters = FakeHeaters(self)
         self.gcode = FakeGcode()
+        self.webhooks = FakeWebhooks()
         self.handlers = {}
         self.shutdown = False
         self.objects = {
             "heaters": self.heaters,
             "gcode": self.gcode,
+            "webhooks": self.webhooks,
             "pins": self,
         }
 
@@ -208,6 +218,22 @@ class FakeGcmd:
         pass
 
 
+class FakeWebRequest:
+    def __init__(self, params):
+        self.params = params
+        self.response = None
+
+    def get_float(self, item, default=None):
+        if item not in self.params:
+            if default is None:
+                raise CommandError("missing %s" % item)
+            return default
+        return float(self.params[item])
+
+    def send(self, data):
+        self.response = data
+
+
 GOOD_FRAME = {
     "temperature": 30.0, "target": 0.0, "requested_target": 0.0,
     "mode": "off", "source": "klipper", "state_revision": 9,
@@ -294,6 +320,83 @@ class KlipperModuleTest(unittest.TestCase):
     def test_status_reports_event_stream_liveness(self):
         self.transport.live = False
         self.assertFalse(self.status()["event_stream_live"])
+
+    # -- dragonbreath/set_target webhook --
+
+    def call_set_target(self, params, resolve=None):
+        handler = self.printer.webhooks.endpoints["dragonbreath/set_target"]
+        if resolve is not None:
+            pauses = []
+
+            def on_pause():
+                pauses.append(1)
+                if len(pauses) == 2:
+                    self.transport.results[self.transport.seq] = resolve
+            self.printer.reactor.on_pause = on_pause
+        # Webhooks run on the reactor while a gcode TEMPERATURE_WAIT can hold
+        # the gcode mutex; the endpoint must complete regardless.
+        self.printer.gcode.mutex_held = True
+        request = FakeWebRequest(params)
+        handler(request)
+        return request.response
+
+    def test_set_target_endpoint_applies_through_the_heater_hook(self):
+        response = self.call_set_target(
+            {"target": 60.0}, resolve={"accepted": True, "reason": None})
+        self.assertEqual([(60.0, False)], self.printer.heaters.calls)
+        self.assertEqual(60.0, self.heater.target_temp)
+        self.assertEqual([60.0], self.transport.targets)
+        self.assertEqual({"accepted": True, "pending": False, "reason": None,
+                          "seq": self.transport.seq, "target": 60.0},
+                         response)
+
+    def test_set_target_endpoint_errors_when_the_hook_is_missing(self):
+        printer = FakePrinter()
+        module = dragonbreath.DragonBreath(FakeConfig(printer))
+        module._transport = self.transport
+        self.transport.results[0] = {"accepted": True, "reason": None}
+        handler = printer.webhooks.endpoints["dragonbreath/set_target"]
+        with self.assertRaises(CommandError):
+            handler(FakeWebRequest({"target": 60.0}))
+        self.assertEqual([], self.transport.targets)
+
+    def test_set_target_endpoint_clears_forced_off_lockout(self):
+        self.module._external_off_lockout = True
+        self.call_set_target(
+            {"target": 60.0}, resolve={"accepted": True, "reason": None})
+        self.assertFalse(self.module._external_off_lockout)
+
+    def test_set_target_endpoint_reports_a_rejection(self):
+        response = self.call_set_target(
+            {"target": 60.0},
+            resolve={"accepted": False, "reason": "countermanded"})
+        self.assertFalse(response["accepted"])
+        self.assertFalse(response["pending"])
+        self.assertEqual("countermanded", response["reason"])
+
+    def test_set_target_endpoint_times_out_as_pending(self):
+        start = self.printer.reactor.monotonic()
+        response = self.call_set_target({"target": 60.0})
+        self.assertIsNone(response["accepted"])
+        self.assertTrue(response["pending"])
+        self.assertEqual(self.transport.seq, response["seq"])
+        elapsed = self.printer.reactor.monotonic() - start
+        self.assertGreaterEqual(elapsed, dragonbreath.SET_TARGET_WAIT)
+        self.assertLess(elapsed, dragonbreath.SET_TARGET_WAIT + 1.)
+
+    def test_set_target_endpoint_rejects_out_of_range(self):
+        with self.assertRaises(CommandError):
+            self.call_set_target({"target": 500.0})
+        self.assertEqual([], self.transport.targets)
+
+    def test_set_target_endpoint_refuses_heat_while_shutdown(self):
+        self.module._in_shutdown = True
+        response = self.call_set_target({"target": 60.0})
+        self.assertFalse(response["accepted"])
+        self.assertEqual("klipper_shutdown", response["reason"])
+        self.assertEqual([], self.transport.targets)
+
+    # -- M141 / M191 --
 
     def test_m141_rejection_does_not_raise(self):
         self.printer.gcode.commands["M141"](FakeGcmd(60.0))
