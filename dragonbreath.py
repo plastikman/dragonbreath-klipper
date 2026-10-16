@@ -83,6 +83,8 @@ WRITE_BACKOFF_MAX_SHIFT = 3
 # polling state, but back SSE reconnects off instead of logging a 503 every second.
 SSE_BACKOFF_MAX_SHIFT = 6
 SSE_BACKOFF_MAX_SECONDS = 30.
+# Consecutive 503s before the busy event stream is reported once at INFO.
+SSE_BUSY_LOG_AFTER = 2
 API_VERSION = 2
 HEARTBEAT_INTERVAL = 30.
 # Re-issues of one heat intent after a revision_conflict that no person caused
@@ -239,6 +241,9 @@ class _DragonBreathHTTP:
             if seq < self._intent_seq:
                 return {"accepted": False, "reason": "superseded"}
         return None
+
+    def event_stream_live(self):
+        return self._event_live
 
     def _record_result_locked(self, seq, accepted, reason):
         self._intent_results[seq] = {"accepted": accepted, "reason": reason}
@@ -642,6 +647,7 @@ class _DragonBreathHTTP:
     # -- SSE observer with polling fallback in the command worker --
     def _event_run(self):
         fail_shift = 0
+        busy_count = 0
         while self._running:
             received_state = False
             try:
@@ -662,6 +668,7 @@ class _DragonBreathHTTP:
                                     self._event_live = True
                                     received_state = True
                                     fail_shift = 0
+                                    busy_count = 0
                                 data_lines = []
                             continue
                         if line.startswith("data:"):
@@ -669,6 +676,14 @@ class _DragonBreathHTTP:
             except urllib.error.HTTPError as exc:
                 exc.close()
                 logger.debug("dragonbreath: SSE HTTP %s", exc.code)
+                if exc.code == 503:
+                    busy_count += 1
+                    if busy_count == SSE_BUSY_LOG_AFTER:
+                        logger.info(
+                            "dragonbreath: device event stream busy (both "
+                            "SSE slots taken, e.g. open DragonBreath dashboard "
+                            "tabs); polling state every %.1fs instead",
+                            self._poll)
             except Exception as exc:
                 logger.debug("dragonbreath: SSE disconnected: %s", exc)
             finally:
@@ -778,7 +793,16 @@ class DragonBreath:
         self.firmware_version = None
         self.lease_owner = None
         self.lease_owned = False
+        # A rejected command stays visible until the next target intent.
         self.protocol_error = None
+        self.protocol_error_code = None
+        self.protocol_error_message = None
+        self.protocol_error_target = None
+        self.protocol_error_seq = 0
+        # A rejection of a heat intent persists until the next intent; a fan or
+        # handshake rejection only until the next good state or fan intent.
+        self._protocol_error_sticky = False
+        self._intent_seq = 0
         self._last_temp_time = 0.
         self._in_shutdown = False
         self._external_off_lockout = False
@@ -860,7 +884,7 @@ class DragonBreath:
         self.target = 0.
         self._external_off_lockout = True
         try:
-            self._transport.force_off()
+            self._intent_seq = self._transport.force_off()
         except Exception as exc:
             logger.warning("dragonbreath: failed to force off on %s: %s", reason, exc)
 
@@ -934,14 +958,11 @@ class DragonBreath:
                 self.is_connected = False
                 continue
             if data.get("protocol_error"):
-                self.protocol_error = data["protocol_error"]
-                if self.target > 0.:
-                    self._clear_heater_target_state()
-                    self.target = 0.
-                    self._external_off_lockout = True
+                self._record_rejection(data)
                 continue
             self.is_connected = True
-            self.protocol_error = None
+            if not self._protocol_error_sticky:
+                self._clear_protocol_error()
             temp = data.get("temperature")
             if temp is not None:
                 self.temperature = float(temp)
@@ -976,9 +997,7 @@ class DragonBreath:
                 logger.warning(
                     "dragonbreath: Klipper lease countermanded by %s; "
                     "accepting authoritative device state", self.source)
-                self._clear_heater_target_state()
-                self.target = 0.
-                self._external_off_lockout = True
+                self._drop_target("countermanded")
 
         # Feed the heater sensor callback every cycle, on the MCU clock so
         # verify_heater compares timestamps from the right domain.
@@ -1008,6 +1027,47 @@ class DragonBreath:
 
         return eventtime + REACTOR_POLL
 
+    def _record_rejection(self, data):
+        # Only a rejection of the intent Klipper still holds may clear its
+        # target; one for an older intent would wipe a newer request.
+        current = bool(data.get("clears_target")
+                       and data.get("seq") == self._intent_seq)
+        if self._protocol_error_sticky and not current:
+            return  # keep the heat rejection the UI is showing
+        self.protocol_error = data["protocol_error"]
+        self.protocol_error_code = data.get("reason") or self.protocol_error
+        self.protocol_error_message = data.get("message")
+        self.protocol_error_target = data.get("target")
+        self.protocol_error_seq += 1
+        self._protocol_error_sticky = current
+        if current:
+            self._drop_target(self.protocol_error_code)
+
+    def _drop_target(self, reason):
+        """Zero Klipper's target after the device refused or overrode it, with
+        one console line. A target already at 0 was dropped before: no repeat."""
+        if self.target <= 0.:
+            return
+        requested = self.target
+        self._clear_heater_target_state()
+        self.target = 0.
+        self._external_off_lockout = True
+        message = (
+            "DragonBreath: chamber target %.0fC not applied (%s); "
+            "chamber target is now 0. Set it again to retry."
+            % (requested, reason))
+        try:
+            self.printer.lookup_object('gcode').respond_info(message)
+        except Exception as exc:
+            logger.debug("dragonbreath: console warning failed: %s", exc)
+
+    def _clear_protocol_error(self):
+        self.protocol_error = None
+        self.protocol_error_code = None
+        self.protocol_error_message = None
+        self.protocol_error_target = None
+        self._protocol_error_sticky = False
+
     def _lookup_heater_target(self):
         try:
             pheaters = self.printer.lookup_object('heaters')
@@ -1025,12 +1085,15 @@ class DragonBreath:
                         float(degrees))
             return
         self.target = float(degrees)
-        self._transport.set_target(degrees)
+        self._intent_seq = self._transport.set_target(degrees)
+        self._clear_protocol_error()
 
     def set_fan_percent(self, percent):
         # Fan-only filtration; independent of the heater, safe to run any time
         # (including while shutdown — it never adds heat). Reactor-thread safe:
         # the transport only records intent and wakes its worker.
+        if not self._protocol_error_sticky:
+            self._clear_protocol_error()
         self._transport.set_fan(percent)
 
     def get_status(self, eventtime):
@@ -1061,6 +1124,11 @@ class DragonBreath:
             "lease_owner": self.lease_owner,
             "lease_owned": self.lease_owned,
             "protocol_error": self.protocol_error,
+            "protocol_error_code": self.protocol_error_code,
+            "protocol_error_message": self.protocol_error_message,
+            "protocol_error_target": self.protocol_error_target,
+            "protocol_error_seq": self.protocol_error_seq,
+            "event_stream_live": bool(self._transport.event_stream_live()),
         }
 
 

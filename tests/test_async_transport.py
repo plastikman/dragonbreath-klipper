@@ -614,6 +614,17 @@ class ApiV2TransportTest(unittest.TestCase):
         self.assertEqual(2, len(self.power_commands()))
         self.assertEqual("lease_lost", self.rejection(messages)["reason"])
 
+    def test_sustained_busy_event_stream_is_logged_once_at_info(self):
+        with self.assertLogs(dragonbreath.logger, level="INFO") as logs:
+            transport = self.transport(poll=0.05)
+            transport.start()
+            self.assertTrue(_wait_until(
+                lambda: len(self.dev.requests("GET", "/api/v2/events")) >= 3,
+                timeout=5.0))
+        busy = [r for r in logs.records
+                if r.levelname == "INFO" and "event stream" in r.getMessage()]
+        self.assertEqual(1, len(busy))
+
     def test_revision_conflict_retries_are_bounded(self):
         messages = []
         transport = self.transport(on_message=messages.append)

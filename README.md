@@ -24,7 +24,8 @@ It talks to DragonBreath's HTTP control API over your LAN (no MQTT broker, no cl
   `GET /api/v2/state` polling only as a reconnect fallback. Complete device
   snapshots feed the heater sensor callback on the MCU clock, so
   `verify_heater` still works. If the device's limited SSE slots are busy,
-  reconnect attempts back off while state polling continues.
+  reconnect attempts back off while state polling continues, and a sustained
+  busy stream is logged once at INFO.
 - An accepted POWER_ON returns a device-issued lease privately in that
   authenticated command response. Public state/events expose only lease
   ownership and expiry metadata. The helper heartbeats only its exact private
@@ -88,7 +89,8 @@ Extra authoritative status is exposed on the `dragonbreath` printer object for
 macros/dashboards: `heating`, `fault`, `inhibited`, `fault_reason`, `ptc_temp`,
 `connected`, `mode`, `source`, `state_revision`, `firmware_version`,
 `lease_owner`, `lease_owned`, `heater_demand`, `fan_percent`, `fan_reason`,
-`device_moonraker_connected`, and `protocol_error`.
+`device_moonraker_connected`, and `event_stream_live` (false while the helper
+is polling because the SSE stream is unavailable).
 
 ### When the device refuses a target
 The device rejects a heat command whose `expected_revision` is stale. Its own
@@ -103,7 +105,20 @@ any other rejection (`fault_latched`, `inhibited`, ...). These rules rely on how
 the firmware stamps `source` on each revision, verified against DragonBreath
 firmware v1.1.18 (API v2); other builds should be checked against them.
 
-A final rejection sets the Klipper target to 0.
+A final rejection, or a button/WebUI countermand, sets the Klipper target to 0
+and prints one console line. A rejected heat command stays in status until the
+next target is set; a fan or handshake rejection clears on the next good state
+or fan request:
+
+| field | meaning |
+|-------|---------|
+| `protocol_error` | firmware error code (`revision_conflict`, `fault_latched`, ...) or `null` |
+| `protocol_error_code` | stable reason: `countermanded`, `conflict_retries_exhausted`, `fault_latched`, `inhibited`, `invalid_command`, `auth_failed`, `missing_lease_id`, `lease_lost`, `heater_busy`, or another firmware code |
+| `protocol_error_message` | firmware message text, or `null` |
+| `protocol_error_target` | the target (C) the rejected request asked for, or `null` |
+| `protocol_error_seq` | counts rejections since Klipper started; never resets |
+
+`M141` never raises on a rejection.
 
 ## Moonraker update manager
 ```ini
