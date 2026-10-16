@@ -90,6 +90,21 @@ macros/dashboards: `heating`, `fault`, `inhibited`, `fault_reason`, `ptc_temp`,
 `lease_owner`, `lease_owned`, `heater_demand`, `fan_percent`, `fan_reason`,
 `device_moonraker_connected`, and `protocol_error`.
 
+### When the device refuses a target
+The device rejects a heat command whose `expected_revision` is stale. Its own
+policy also advances the revision (AUTO engage, the fan-only filtration band
+following the bed setpoint), so `M140` right before `M141` can race it. When the
+fresh state shows nobody countermanded the request (same mode, target and
+source, no other lease holder, no fault), the helper re-sends the same target
+with the fresh revision, up to twice. A watchdog timer edge that leaves the
+device idle (a local run or drying cycle ending) is retried too, unless the lease
+that expired was Klipper's own. A button, WebUI or safety change is final, as is
+any other rejection (`fault_latched`, `inhibited`, ...). These rules rely on how
+the firmware stamps `source` on each revision, verified against DragonBreath
+firmware v1.1.18 (API v2); other builds should be checked against them.
+
+A final rejection sets the Klipper target to 0.
+
 ## Moonraker update manager
 ```ini
 [update_manager dragonbreath-klipper]

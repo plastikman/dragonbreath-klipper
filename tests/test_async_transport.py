@@ -29,6 +29,11 @@ class _MockDevice:
         self.external_after_command_failure = False
         self.reject_next_power_on = False
         self.omit_lease_id = False
+        # Callables run (one per attempt) inside a power_on before its revision
+        # check: they move the device the way its own policy or another actor
+        # would between the helper reading state and the command arriving.
+        self.before_power_on = []
+        self.bump_every_power_on = False
         self.lease_counter = 0
         self.active_lease_id = None
         self._requests = []
@@ -118,6 +123,11 @@ class _MockDevice:
                     self.external_off_locked("button")
                 return 500, {"error": "temporary"}
             command = body["command"]["name"]
+            if command == "power_on":
+                if self.before_power_on:
+                    self.before_power_on.pop(0)(self.state)
+                elif self.bump_every_power_on:
+                    self.autonomous_bump_locked(self.state)
             if command == "power_on" and self.reject_next_power_on:
                 self.reject_next_power_on = False
                 self.external_off_locked("button")
@@ -183,6 +193,12 @@ class _MockDevice:
         self.state["control"]["lease"] = {
             "active": False, "owner": None, "expires_in_ms": 0,
         }
+
+    @staticmethod
+    def autonomous_bump_locked(state):
+        # pb_policy_tick's auto_filtering / auto_engaged edge: the revision
+        # advances under the existing source, with mode and target untouched.
+        state["state_revision"] += 1
 
     def lease_matches(self, lease_id):
         with self._lock:
@@ -430,18 +446,223 @@ class ApiV2TransportTest(unittest.TestCase):
         self.assertEqual(0.0, transport._desired_target)
         self.assertEqual(before, len(self.power_commands()))
 
-    def test_revision_conflict_is_terminal_not_blind_retry(self):
+    def rejection(self, messages):
+        found = [m for m in messages if m.get("protocol_error")]
+        return found[-1] if found else None
+
+    def test_revision_conflict_from_device_policy_bump_retries_once(self):
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        self.dev.before_power_on.append(_MockDevice.autonomous_bump_locked)
+        seq = transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: transport._applied_target == 55.0, timeout=5.0))
+        commands = self.power_commands()
+        self.assertEqual(2, len(commands))
+        self.assertEqual(2, len({body["request_id"] for body in commands}))
+        self.assertEqual(
+            commands[0]["expected_revision"] + 1,
+            commands[1]["expected_revision"])
+        self.assertIsNotNone(transport._lease_id)
+        self.assertEqual(55.0, transport._desired_target)
+        self.assertIsNone(self.rejection(messages))
+        self.assertEqual(
+            {"accepted": True, "reason": None}, transport.intent_result(seq))
+
+    def test_revision_conflict_from_button_stays_terminal(self):
         messages = []
         transport = self.transport(on_message=messages.append)
         self.wait_initial_off(transport)
         self.dev.reject_next_power_on = True
-        transport.set_target(55.0)
+        seq = transport.set_target(55.0)
         self.assertTrue(_wait_until(
-            lambda: any(m.get("protocol_error") == "revision_conflict"
-                        for m in messages), timeout=5.0))
+            lambda: self.rejection(messages) is not None, timeout=5.0))
         time.sleep(0.3)
         self.assertEqual(1, len(self.power_commands()))
         self.assertEqual(0.0, transport._desired_target)
+        rejection = self.rejection(messages)
+        self.assertEqual("revision_conflict", rejection["protocol_error"])
+        self.assertEqual("countermanded", rejection["reason"])
+        self.assertEqual(55.0, rejection["target"])
+        self.assertEqual(seq, rejection["seq"])
+        self.assertTrue(rejection["clears_target"])
+        self.assertEqual({"accepted": False, "reason": "countermanded"},
+                         transport.intent_result(seq))
+
+    def test_revision_conflict_from_web_heat_stays_terminal(self):
+        def web_power_on(state):
+            state["state_revision"] += 1
+            state["source"] = "web"
+            state["mode"] = "power_on"
+            state["target"]["requested_c"] = 40.0
+            state["control"]["lease"] = {
+                "active": True, "owner": "browser-1", "expires_in_ms": 300000}
+
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        self.dev.before_power_on.append(web_power_on)
+        transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        time.sleep(0.3)
+        self.assertEqual(1, len(self.power_commands()))
+        self.assertEqual("countermanded", self.rejection(messages)["reason"])
+
+    def test_web_fan_toggle_counts_as_human_countermand(self):
+        def web_filter(state):
+            state["state_revision"] += 1
+            state["source"] = "web"
+
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        self.dev.before_power_on.append(web_filter)
+        transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        self.assertEqual(1, len(self.power_commands()))
+        self.assertEqual("countermanded", self.rejection(messages)["reason"])
+
+    def test_revision_conflict_with_fault_latched_stays_terminal(self):
+        def fault(state):
+            state["state_revision"] += 1
+            state["safety"]["fault_latched"] = True
+
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        self.dev.before_power_on.append(fault)
+        transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        time.sleep(0.3)
+        self.assertEqual(1, len(self.power_commands()))
+        self.assertEqual("fault_latched", self.rejection(messages)["reason"])
+
+    def wait_cached(self, transport, revision):
+        self.assertTrue(_wait_until(
+            lambda: transport._current_revision() == revision, timeout=5.0))
+
+    def device_mode(self, mode, source, target):
+        with self.dev._lock:
+            self.dev.state["state_revision"] += 1
+            self.dev.state["mode"] = mode
+            self.dev.state["source"] = source
+            self.dev.state["target"]["requested_c"] = target
+            return self.dev.state["state_revision"]
+
+    @staticmethod
+    def watchdog_edge(mode, target):
+        # restore_or_off_locked / set_off_locked(DB_SOURCE_WATCHDOG): a local
+        # run or a drying cycle reaching its deadline.
+        def edge(state):
+            state["state_revision"] += 1
+            state["mode"] = mode
+            state["source"] = "watchdog"
+            state["target"]["requested_c"] = target
+            state["control"]["lease"] = {
+                "active": False, "owner": None, "expires_in_ms": 0}
+        return edge
+
+    def test_drying_ending_under_a_command_is_retried(self):
+        transport = self.transport()
+        self.wait_initial_off(transport)
+        self.wait_cached(transport, self.device_mode("drying", "button", 60.0))
+        self.dev.before_power_on.append(self.watchdog_edge("off", 0.0))
+        seq = transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: transport._applied_target == 55.0, timeout=5.0))
+        self.assertEqual(2, len(self.power_commands()))
+        self.assertEqual({"accepted": True, "reason": None},
+                         transport.intent_result(seq))
+
+    def test_local_run_reverting_to_auto_under_a_command_is_retried(self):
+        transport = self.transport()
+        self.wait_initial_off(transport)
+        self.wait_cached(transport, self.device_mode("power_on", "button", 50.0))
+        self.dev.before_power_on.append(self.watchdog_edge("auto", 60.0))
+        transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: transport._applied_target == 55.0, timeout=5.0))
+        self.assertEqual(2, len(self.power_commands()))
+
+    def test_watchdog_heating_mode_is_not_retried(self):
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        self.dev.before_power_on.append(self.watchdog_edge("drying", 60.0))
+        transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        self.assertEqual(1, len(self.power_commands()))
+        self.assertEqual("countermanded", self.rejection(messages)["reason"])
+
+    def test_expiry_of_our_own_lease_is_not_retried(self):
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        transport.set_target(50.0)
+        self.assertTrue(_wait_until(
+            lambda: transport._lease_id is not None, timeout=5.0))
+        self.dev.before_power_on.append(self.watchdog_edge("off", 0.0))
+        transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        time.sleep(0.3)
+        self.assertEqual(2, len(self.power_commands()))
+        self.assertEqual("lease_lost", self.rejection(messages)["reason"])
+
+    def test_revision_conflict_retries_are_bounded(self):
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        self.dev.bump_every_power_on = True
+        seq = transport.set_target(55.0)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        time.sleep(0.3)
+        self.assertEqual(1 + dragonbreath.CONFLICT_RETRY_MAX,
+                         len(self.power_commands()))
+        self.assertEqual(0.0, transport._desired_target)
+        self.assertEqual("conflict_retries_exhausted",
+                         self.rejection(messages)["reason"])
+        self.assertEqual(
+            {"accepted": False, "reason": "conflict_retries_exhausted"},
+            transport.intent_result(seq))
+
+    def test_rejection_of_a_superseded_intent_keeps_the_new_target(self):
+        transport = self.transport()
+        self.wait_initial_off(transport)
+        first = transport.set_target(55.0)
+        second = transport.set_target(60.0)
+        self.assertTrue(_wait_until(
+            lambda: transport._applied_target == 60.0, timeout=5.0))
+        self.assertEqual({"accepted": False, "reason": "superseded"},
+                         transport.intent_result(first))
+        self.assertEqual({"accepted": True, "reason": None},
+                         transport.intent_result(second))
+
+    def test_fan_rejection_does_not_clear_the_heater_target(self):
+        messages = []
+        transport = self.transport(on_message=messages.append)
+        self.wait_initial_off(transport)
+        original = self.dev.handle_command
+
+        def busy_filter(body):
+            if body["command"]["name"] == "filter":
+                return 409, {"ok": False, "error": "heater_busy",
+                             "state": self.dev.snapshot()}
+            return original(body)
+
+        self.dev.handle_command = busy_filter
+        transport.set_fan(100)
+        self.assertTrue(_wait_until(
+            lambda: self.rejection(messages) is not None, timeout=5.0))
+        rejection = self.rejection(messages)
+        self.assertEqual("heater_busy", rejection["reason"])
+        self.assertFalse(rejection["clears_target"])
 
     def test_retry_keeps_original_expected_revision(self):
         messages = []

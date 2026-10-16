@@ -85,6 +85,11 @@ SSE_BACKOFF_MAX_SHIFT = 6
 SSE_BACKOFF_MAX_SECONDS = 30.
 API_VERSION = 2
 HEARTBEAT_INTERVAL = 30.
+# Re-issues of one heat intent after a revision_conflict that no person caused
+# (the device's own AUTO/filtration edges bump the revision under a command).
+CONFLICT_RETRY_MAX = 2
+# Intent outcomes kept for intent_result(); older seqs read as superseded.
+INTENT_RESULTS_KEPT = 16
 
 
 # ─── DragonBreath HTTP transport ────────────────────────────────────────────────
@@ -129,6 +134,7 @@ class _DragonBreathHTTP:
         self._wake = threading.Event()
         self._event_stop = threading.Event()
         self._last_protocol_error = None
+        self._intent_results = collections.OrderedDict()
 
     # -- lifecycle --
     def start(self):
@@ -202,13 +208,16 @@ class _DragonBreathHTTP:
 
     # -- control (called on the reactor thread; assign/enqueue only, never I/O) --
     def set_target(self, degrees):
+        """Record a target intent and return its seq for intent_result()."""
         with self._state_lock:
             self._desired_target = max(0., float(degrees))
             if self._desired_target <= 0.:
                 self._lease_id = None
             self._intent_seq += 1
             self._pending = None
+            seq = self._intent_seq
         self._wake.set()
+        return seq
 
     def force_off(self):
         with self._state_lock:
@@ -216,7 +225,25 @@ class _DragonBreathHTTP:
             self._intent_seq += 1
             self._pending = None
             self._lease_id = None
+            seq = self._intent_seq
         self._wake.set()
+        return seq
+
+    def intent_result(self, seq):
+        """{"accepted": bool, "reason": str|None} once the worker resolved the
+        intent, else None. An intent replaced before it resolved is superseded."""
+        with self._state_lock:
+            result = self._intent_results.get(seq)
+            if result is not None:
+                return dict(result)
+            if seq < self._intent_seq:
+                return {"accepted": False, "reason": "superseded"}
+        return None
+
+    def _record_result_locked(self, seq, accepted, reason):
+        self._intent_results[seq] = {"accepted": accepted, "reason": reason}
+        while len(self._intent_results) > INTENT_RESULTS_KEPT:
+            self._intent_results.popitem(last=False)
 
     def set_fan(self, percent):
         # Reactor-thread entry: record fan-only filtration intent, wake the worker.
@@ -259,7 +286,7 @@ class _DragonBreathHTTP:
                 self._accept_state(data.get("state"))
             elif status in (400, 403, 409):
                 self._accept_state(data.get("state"))
-                self._notify_protocol_error(data)
+                self._notify_protocol_error(data, clears_target=False)
             else:
                 self._cmd_queue.appendleft(pending)
                 ok = False
@@ -277,11 +304,12 @@ class _DragonBreathHTTP:
             command = "off" if desired <= 0. else "power_on"
             fields = {} if command == "off" else {"target_c": desired}
             revision = None
+            basis = None
             if command != "off":
-                revision = self._current_revision()
+                revision, basis = self._current_basis()
                 if revision is None:
                     self._get_state()
-                    revision = self._current_revision()
+                    revision, basis = self._current_basis()
                     if revision is None:
                         return False
             pending = {
@@ -291,55 +319,146 @@ class _DragonBreathHTTP:
                 "fields": fields,
                 "request_id": uuid.uuid4().hex,
                 "expected_revision": revision,
+                "basis": basis,
+                "conflict_retries": 0,
             }
             with self._state_lock:
                 self._pending = pending
-        try:
-            status, data = self._send_command(
-                pending["command"], pending["fields"],
-                pending["expected_revision"],
-                pending["request_id"])
-        except Exception:
-            return False  # retry the same request_id: firmware replay is idempotent
-        if 200 <= status < 300:
-            if pending["command"] == "power_on":
-                lease_id = data.get("lease_id")
-                if not isinstance(lease_id, str) or len(lease_id) != 32:
-                    self._accept_state(data.get("state"))
-                    self._notify_protocol_error({
-                        "error": "missing_lease_id",
-                        "message": "POWER_ON response did not include an exact lease",
-                    })
-                    # Fail safe and schedule an unconditional OFF. A successful
-                    # heat command is not owned until its private lease arrives.
+        while True:
+            try:
+                status, data = self._send_command(
+                    pending["command"], pending["fields"],
+                    pending["expected_revision"],
+                    pending["request_id"])
+            except Exception:
+                return False  # retry the same request_id: firmware replay is idempotent
+            if 200 <= status < 300:
+                return self._apply_success(pending, data)
+            if status not in (400, 403, 409):
+                return False
+            self._accept_state(data.get("state"))
+            reason = data.get("error") or "rejected"
+            if status == 409 and reason == "revision_conflict" \
+                    and pending["command"] == "power_on":
+                try:
+                    reason = self._conflict_reason(pending)
+                except Exception:
+                    return False  # no fresh state to judge by; resend later
+                if reason is None:
                     with self._state_lock:
-                        self._lease_id = None
-                        self._desired_target = 0.
-                        self._intent_seq += 1
-                        if self._pending is pending:
-                            self._pending = None
-                    return False
+                        if self._intent_seq != pending["seq"]:
+                            return True  # superseded; the next cycle sends it
+                    self._rearm_after_conflict(pending)
+                    continue
+            self._reject(pending, reason, data)
+            return True
+
+    def _apply_success(self, pending, data):
+        if pending["command"] == "power_on":
+            lease_id = data.get("lease_id")
+            if not isinstance(lease_id, str) or len(lease_id) != 32:
+                self._accept_state(data.get("state"))
+                self._notify_protocol_error({
+                    "error": "missing_lease_id",
+                    "message": "POWER_ON response did not include an exact lease",
+                }, seq=pending["seq"], target=pending["target"])
+                # Fail safe and schedule an unconditional OFF. A successful
+                # heat command is not owned until its private lease arrives.
                 with self._state_lock:
-                    self._lease_id = lease_id
-            self._accept_state(data.get("state"))
-            self._applied_target = pending["target"]
-            self._applied_seq = pending["seq"]
-            with self._state_lock:
-                if self._pending is pending:
-                    self._pending = None
-            return True
-        if status in (400, 403, 409):
-            self._accept_state(data.get("state"))
-            self._notify_protocol_error(data)
-            self._applied_seq = pending["seq"]  # explicit rejection is terminal
-            with self._state_lock:
-                if pending["target"] > 0.:
-                    self._desired_target = 0.
+                    self._record_result_locked(
+                        pending["seq"], False, "missing_lease_id")
                     self._lease_id = None
-                if self._pending is pending:
-                    self._pending = None
-            return True
-        return False
+                    self._desired_target = 0.
+                    self._intent_seq += 1
+                    if self._pending is pending:
+                        self._pending = None
+                return False
+            with self._state_lock:
+                self._lease_id = lease_id
+        self._accept_state(data.get("state"))
+        self._applied_target = pending["target"]
+        self._applied_seq = pending["seq"]
+        with self._state_lock:
+            self._record_result_locked(pending["seq"], True, None)
+            if self._pending is pending:
+                self._pending = None
+        return True
+
+    def _reject(self, pending, reason, data):
+        # An explicit rejection is terminal for this intent: Klipper's target
+        # drops to 0 rather than holding a heat request the device refused.
+        self._applied_seq = pending["seq"]
+        clears = pending["target"] > 0.
+        with self._state_lock:
+            self._record_result_locked(pending["seq"], False, reason)
+            if clears and self._intent_seq == pending["seq"]:
+                self._desired_target = 0.
+                self._lease_id = None
+            if self._pending is pending:
+                self._pending = None
+        self._notify_protocol_error(
+            data, reason=reason, seq=pending["seq"],
+            target=pending["target"], clears_target=clears)
+
+    def _conflict_reason(self, pending):
+        """Why a revision_conflict on this heat intent is final, or None when
+        nobody countermanded it and the intent may be re-issued as-is.
+
+        The firmware advances state_revision on its own without changing mode,
+        requested target or source: AUTO engage and the fan-only filtration
+        band both follow the bed setpoint (pb_policy_tick). Every person or
+        controller action instead changes the mode or target, takes the lease,
+        or stamps its own source (web, button, safety, watchdog). These
+        source-stamping semantics were verified against DragonBreath firmware
+        v1.1.18 (API v2); check them again before relying on another build.
+
+        A watchdog edge that leaves the device idle (a local run or a drying
+        cycle reaching its deadline: OFF, or AUTO waiting) is a timer, not a
+        person, so it is retried unless the lease that expired was ours."""
+        if pending["conflict_retries"] >= CONFLICT_RETRY_MAX:
+            return "conflict_retries_exhausted"
+        with self._state_lock:
+            fresh = self._latest_state
+        if fresh is None or fresh.get("state_revision") == \
+                pending["expected_revision"]:
+            fresh = self._get_state()
+        basis = pending["basis"] or {}
+        safety = fresh.get("safety") or {}
+        if safety.get("fault_latched"):
+            return "fault_latched"
+        if safety.get("inhibited"):
+            return "inhibited"
+        lease = (fresh.get("control") or {}).get("lease") or {}
+        if lease.get("active"):
+            if lease.get("owner") != self._actor_id:
+                return "countermanded"
+            if fresh.get("source") == "klipper":
+                return None  # our own earlier attempt landed; claim its lease
+        if fresh.get("source") == "watchdog" != basis.get("source") \
+                and fresh.get("mode") in ("off", "auto"):
+            basis_lease = (basis.get("control") or {}).get("lease") or {}
+            if basis_lease.get("active") \
+                    and basis_lease.get("owner") == self._actor_id:
+                return "lease_lost"
+            return None
+        if fresh.get("source") not in (basis.get("source"), "klipper"):
+            return "countermanded"
+        if fresh.get("mode") != basis.get("mode"):
+            return "countermanded"
+        if (fresh.get("target") or {}).get("requested_c") != \
+                (basis.get("target") or {}).get("requested_c"):
+            return "countermanded"
+        return None
+
+    def _rearm_after_conflict(self, pending):
+        revision, basis = self._current_basis()
+        logger.info("dragonbreath: revision moved under target %.1f "
+                    "(%s -> %s) with no countermand; re-issuing",
+                    pending["target"], pending["expected_revision"], revision)
+        pending["conflict_retries"] += 1
+        pending["expected_revision"] = revision
+        pending["basis"] = basis
+        pending["request_id"] = uuid.uuid4().hex
 
     def _sync_fan(self):
         # Reconcile the fan-only filtration blower to the reactor's desired level.
@@ -360,7 +479,7 @@ class _DragonBreathHTTP:
             return True
         if status in (400, 403, 409):
             self._accept_state(data.get("state"))
-            self._notify_protocol_error(data)
+            self._notify_protocol_error(data, clears_target=False)
             self._last_sent_fan = desired  # explicit rejection is terminal; don't spin
             return True
         return False
@@ -384,8 +503,12 @@ class _DragonBreathHTTP:
         if 200 <= status < 300:
             return True
         self._accept_state(data.get("state"))
-        self._notify_protocol_error(data)
         if status in (400, 403, 409):
+            with self._state_lock:
+                seq = self._intent_seq
+                target = self._desired_target
+            self._notify_protocol_error(
+                data, reason="lease_lost", seq=seq, target=target)
             with self._state_lock:
                 if self._lease_id == lease_id:
                     self._lease_id = None
@@ -397,7 +520,8 @@ class _DragonBreathHTTP:
     def _handshake(self):
         status, data = self._request_json("GET", "/api/v2/info", quiet=True)
         if status != 200 or data.get("api_version") != API_VERSION:
-            self._notify_protocol_error({"error": "unsupported_api_version"})
+            self._notify_protocol_error({"error": "unsupported_api_version"},
+                                        clears_target=False)
             raise RuntimeError(
                 "DragonBreath API v2 required (device returned HTTP %s, API %r)"
                 % (status, data.get("api_version")))
@@ -408,6 +532,13 @@ class _DragonBreathHTTP:
             raise RuntimeError("GET /api/v2/state returned HTTP %s" % status)
         self._accept_state(data)
         return data
+
+    def _current_basis(self):
+        """The cached snapshot a heat command is built on, with its revision."""
+        with self._state_lock:
+            if self._latest_state is None:
+                return None, None
+            return int(self._latest_state["state_revision"]), self._latest_state
 
     def _current_revision(self):
         with self._state_lock:
@@ -489,7 +620,8 @@ class _DragonBreathHTTP:
             "lease_owner": lease.get("owner"),
         }
 
-    def _notify_protocol_error(self, data):
+    def _notify_protocol_error(self, data, reason=None, seq=None,
+                               target=None, clears_target=True):
         if not isinstance(data, dict):
             return
         code = data.get("error")
@@ -498,7 +630,14 @@ class _DragonBreathHTTP:
                 logger.warning("dragonbreath: API command rejected: %s (%s)",
                                code, data.get("message", "no detail"))
             self._last_protocol_error = code
-            self._on_message({"protocol_error": code})
+            self._on_message({
+                "protocol_error": code,
+                "reason": reason or code,
+                "message": data.get("message"),
+                "seq": seq,
+                "target": target,
+                "clears_target": clears_target,
+            })
 
     # -- SSE observer with polling fallback in the command worker --
     def _event_run(self):
