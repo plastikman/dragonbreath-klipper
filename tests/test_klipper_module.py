@@ -56,6 +56,9 @@ class FakeHeater:
     def check_busy(self, eventtime):
         return self.temperature < self.target_temp - 2.
 
+    def get_temp(self, eventtime):
+        return self.temperature, self.target_temp
+
 
 class FakeHeaters:
     def __init__(self, printer):
@@ -88,6 +91,14 @@ class FakeGcode:
         self.commands = {}
         self.responses = []
         self.mutex_held = False
+        # Kalico's HEATER_INTERRUPT counter (klippy/gcode.py); None models
+        # mainline and Snapmaker's Klipper, which have no such counter.
+        self.interrupts = None
+
+    def __getattr__(self, name):
+        if name == "get_interrupt_counter" and self.interrupts is not None:
+            return lambda: self.interrupts
+        raise AttributeError(name)
 
     def register_command(self, name, func, desc=None):
         self.commands[name] = func
@@ -162,6 +173,12 @@ class FakeConfig:
 
     def get(self, key, default=None):
         return self.options.get(key, default)
+
+    def getchoice(self, key, choices, default=None):
+        value = self.options.get(key, default)
+        if value not in choices:
+            raise ValueError("invalid choice %r" % (value,))
+        return choices[value]
 
     def getint(self, key, default=None, **kw):
         return default
@@ -404,6 +421,20 @@ class KlipperModuleTest(unittest.TestCase):
         self.poll()
         self.assertEqual(0.0, self.heater.target_temp)
 
+    def run_m191(self, steps, target=60.0):
+        """Run M191 S<target>; steps[i] runs at the i-th reactor pause."""
+        pending = list(steps)
+
+        def on_pause():
+            if pending:
+                pending.pop(0)()
+        self.printer.reactor.on_pause = on_pause
+        self.printer.gcode.commands["M191"](FakeGcmd(target))
+        return pending
+
+    def warm(self):
+        self.heater.temperature = 61.0
+
     def deliver_rejection(self, reason="countermanded"):
         self.reject(self.transport.seq, 60.0, reason=reason)
         self.poll()
@@ -413,14 +444,144 @@ class KlipperModuleTest(unittest.TestCase):
         self.module._enqueue(frame)
         self.poll()
 
+    def retry_via_endpoint(self):
+        self.printer.heaters.set_temperature(self.heater, 60.0, False)
+
     def warnings(self):
         return [r for r in self.printer.gcode.responses
                 if "DragonBreath" in r]
 
-    def test_m141_rejection_warns_once(self):
+    def assert_waited_through_zeroing(self, zero):
+        nothing = lambda: None
+        left = self.run_m191([zero, nothing, nothing, nothing,
+                              self.retry_via_endpoint, nothing, self.warm])
+        self.assertEqual([], left)  # returned only after the chamber warmed
+        self.assertEqual(60.0, self.heater.target_temp)
+        self.assertEqual(1, len(self.warnings()))
+        self.assertFalse(self.warnings()[0].startswith("!!"))
+
+    def test_m191_keeps_waiting_after_a_rejection_and_never_raises(self):
+        self.assert_waited_through_zeroing(self.deliver_rejection)
+
+    def test_m191_keeps_waiting_after_a_countermand(self):
+        self.assert_waited_through_zeroing(self.deliver_countermand)
+
+    def test_m191_keeps_waiting_after_the_heartbeat_loses_the_lease(self):
+        self.assert_waited_through_zeroing(
+            lambda: self.deliver_rejection(reason="lease_lost"))
+
+    def test_m191_counts_one_warning_when_both_paths_fire(self):
+        def both():
+            self.deliver_rejection(reason="lease_lost")
+            self.deliver_countermand()
+        self.assert_waited_through_zeroing(both)
+
+    def test_m191_ends_when_the_chamber_heats_with_the_target_still_zero(self):
+        # Someone turns the heater back on at the box: Klipper's target stays
+        # 0, but the chamber reaching the M191 value releases the print.
+        nothing = lambda: None
+        left = self.run_m191([self.deliver_countermand, nothing, self.warm,
+                              nothing])
+        self.assertEqual([nothing], left)
+        self.assertEqual(0.0, self.heater.target_temp)
+
+    def test_m191_holds_below_its_value_with_the_target_zero(self):
+        def nearly():
+            self.heater.temperature = 59.0
+        stop = lambda: self.printer.send_event("pause_resume:cancel")
+        left = self.run_m191([self.deliver_rejection, nearly, lambda: None,
+                              stop, self.warm])
+        self.assertEqual([self.warm], left)
+
+    def test_m191_warning_says_how_to_continue(self):
+        nothing = lambda: None
+        self.run_m191([self.deliver_countermand, nothing, self.warm])
+        warning = self.warnings()[0]
+        self.assertFalse(warning.startswith("!!"))
+        for text in ("waiting for the chamber to reach 60", "heater is off",
+                     "countermanded", "at the heater", "Try again",
+                     "Cancel", "Console commands"):
+            self.assertIn(text, warning)
+
+    def test_m141_rejection_warning_does_not_mention_a_wait(self):
         self.printer.gcode.commands["M141"](FakeGcmd(60.0))
         self.deliver_rejection()
         self.assertEqual(1, len(self.warnings()))
+        self.assertNotIn("waiting", self.warnings()[0])
+
+    def test_m191_ends_when_a_new_zero_target_is_set(self):
+        def turn_off():
+            self.printer.heaters.set_temperature(self.heater, 0., False)
+        left = self.run_m191([self.deliver_rejection, turn_off, self.warm])
+        self.assertEqual([self.warm], left)
+
+    def test_m191_ends_on_print_cancel_event(self):
+        cancel = lambda: self.printer.send_event("pause_resume:cancel")
+        left = self.run_m191([self.deliver_rejection, cancel, self.warm])
+        self.assertEqual([self.warm], left)
+
+    def test_m191_ends_on_kalico_interrupt(self):
+        self.printer.gcode.interrupts = 0
+
+        def interrupt():
+            self.printer.gcode.interrupts += 1
+        left = self.run_m191([self.deliver_rejection, interrupt, self.warm])
+        self.assertEqual([self.warm], left)
+
+    def test_m191_ends_on_shutdown(self):
+        def shutdown():
+            self.printer.shutdown = True
+        left = self.run_m191([self.deliver_rejection, shutdown, self.warm])
+        self.assertEqual([self.warm], left)
+
+    def test_m191_succeeds_when_the_chamber_reaches_target(self):
+        self.assertEqual([], self.run_m191([self.warm]))
+        self.assertEqual(60.0, self.heater.target_temp)
+
+    def test_m191_publishes_its_wait_in_status(self):
+        seen = []
+
+        def look():
+            seen.append((self.status()["wait_active"],
+                         self.status()["wait_target"]))
+        self.assertEqual((False, None), (self.status()["wait_active"],
+                                         self.status()["wait_target"]))
+        self.run_m191([look, self.deliver_rejection, look, self.warm])
+        self.assertEqual([(True, 60.0), (True, 60.0)], seen)
+        self.assertFalse(self.status()["wait_active"])
+        self.assertIsNone(self.status()["wait_target"])
+
+    def test_m191_wait_target_follows_a_new_target(self):
+        seen = []
+
+        def retarget():
+            self.printer.heaters.set_temperature(self.heater, 65.0, False)
+        look = lambda: seen.append(self.status()["wait_target"])
+        stop = lambda: self.printer.send_event("pause_resume:cancel")
+        self.run_m191([retarget, look, stop])
+        self.assertEqual([65.0], seen)
+        self.assertFalse(self.status()["wait_active"])
+
+    def test_m191_wait_status_clears_on_shutdown(self):
+        def shutdown():
+            self.printer.shutdown = True
+        self.run_m191([self.deliver_rejection, shutdown])
+        self.assertFalse(self.status()["wait_active"])
+
+    def test_m191_prints_the_stock_temperature_report_each_second(self):
+        self.printer.heaters._get_temp = lambda eventtime: \
+            "B:60.0 /60.0 dragonbreath:%.1f /%.1f" % (
+                self.heater.temperature, self.heater.target_temp)
+        self.run_m191([lambda: None, self.warm])
+        reports = [r for r in self.printer.gcode.responses
+                   if r.startswith("B:")]
+        self.assertEqual(2, len(reports))
+
+    def test_m191_zero_does_not_wait(self):
+        self.printer.gcode.commands["M191"](FakeGcmd(0.))
+        self.assertEqual(0, self.printer.reactor.pauses)
+
+    # -- non-heat rejections --
 
     def test_fan_rejection_clears_on_the_next_state_frame(self):
         self.reject(None, None, reason="heater_busy", code="heater_busy",
@@ -449,6 +610,44 @@ class KlipperModuleTest(unittest.TestCase):
         self.module.set_fan_percent(0)
         self.assertEqual("revision_conflict", self.status()["protocol_error"])
 
+
+
+class ContinueOnRejectionTest(KlipperModuleTest):
+    """m191_on_rejection: continue keeps Klipper's own wait semantics."""
+    options = {"m191_on_rejection": "continue"}
+
+    def test_m191_returns_when_a_rejection_zeroes_its_target(self):
+        left = self.run_m191([self.deliver_rejection, self.warm])
+        self.assertEqual([self.warm], left)
+        self.assertFalse(self.status()["wait_active"])
+
+    def test_m191_returns_when_a_countermand_zeroes_its_target(self):
+        left = self.run_m191([self.deliver_countermand, self.warm])
+        self.assertEqual([self.warm], left)
+
+    def test_warning_does_not_claim_the_print_is_waiting(self):
+        self.run_m191([self.deliver_rejection, self.warm])
+        self.assertEqual(1, len(self.warnings()))
+        self.assertNotIn("waiting", self.warnings()[0])
+
+
+# Only the tests above run in continue mode; the inherited ones pin wait mode.
+for _name in dir(KlipperModuleTest):
+    if _name.startswith("test") and _name not in vars(ContinueOnRejectionTest):
+        setattr(ContinueOnRejectionTest, _name, None)
+
+
+class ConfigTest(unittest.TestCase):
+    def test_m191_on_rejection_rejects_unknown_values(self):
+        printer = FakePrinter()
+        with self.assertRaises(ValueError):
+            dragonbreath.DragonBreath(
+                FakeConfig(printer, {"m191_on_rejection": "pause"}))
+
+    def test_m191_on_rejection_defaults_to_wait(self):
+        printer = FakePrinter()
+        module = dragonbreath.DragonBreath(FakeConfig(printer))
+        self.assertEqual("wait", module._m191_on_rejection)
 
 
 if __name__ == "__main__":

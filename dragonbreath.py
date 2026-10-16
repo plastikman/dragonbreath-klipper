@@ -40,6 +40,8 @@
 #   heating_gain: 1
 #
 # M141/M191 are registered automatically (set register_macros: False to opt out).
+#   #m191_on_rejection: wait   # wait | continue: what M191 does when the device
+#                              # refuses or overrides its target (see README)
 
 import json
 import logging
@@ -770,6 +772,9 @@ class DragonBreath:
         token = config.get("token", "web")
         poll = config.getfloat("poll_interval", 2.0, above=0.25, maxval=30.)
         self._register_macros = config.getboolean("register_macros", True)
+        self._m191_on_rejection = config.getchoice(
+            "m191_on_rejection", {"wait": "wait", "continue": "continue"},
+            "wait")
 
         # State (owned by the reactor thread).
         self.temperature = 0.
@@ -806,6 +811,8 @@ class DragonBreath:
         # handshake rejection only until the next good state or fan intent.
         self._protocol_error_sticky = False
         self._intent_seq = 0
+        self._wait_cancelled = False
+        self._waiting_for = None   # chamber temperature M191 is holding for
         self._last_temp_time = 0.
         self._in_shutdown = False
         self._external_off_lockout = False
@@ -830,6 +837,9 @@ class DragonBreath:
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
         self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        # Fired before CANCEL_PRINT queues behind the gcode mutex that M191 holds.
+        self.printer.register_event_handler("pause_resume:cancel",
+                                            self._handle_print_cancel)
 
         self._poll_timer = self.reactor.register_timer(
             self._reactor_poll, self.reactor.NEVER)
@@ -931,7 +941,63 @@ class DragonBreath:
         self._set_heater(gcmd.get_float('S', 0.), wait=False, gcmd=gcmd)
 
     def _cmd_M191(self, gcmd):
-        self._set_heater(gcmd.get_float('S', 0.), wait=True, gcmd=gcmd)
+        temp = gcmd.get_float('S', 0.)
+        self._set_heater(temp, wait=False, gcmd=gcmd)
+        if temp > 0.:
+            self._wait_for_chamber(temp)
+
+    def _handle_print_cancel(self):
+        self._wait_cancelled = True
+
+    def _wait_for_chamber(self, temp):
+        # Klipper's own heater wait ends as soon as the target reads 0, so a
+        # rejected or countermanded target would count as reached. Wait here
+        # instead until the chamber is hot, whatever heated it (a retry, or
+        # the heater turned back on at the box with Klipper's target still 0),
+        # or someone sets a target of 0, the print is cancelled or
+        # interrupted, or Klipper shuts down. While this holds the gcode mutex
+        # no console command runs; printer.print.cancel, emergency_stop and
+        # dragonbreath/set_target still reach Klipper.
+        try:
+            if self.printer.get_start_args().get('debugoutput') is not None:
+                return
+        except AttributeError:
+            pass
+        heater = self._heater
+        gcode = self.printer.lookup_object('gcode')
+        get_temp = getattr(self.printer.lookup_object('heaters'),
+                           '_get_temp', None)
+        # Kalico's HEATER_INTERRUPT bumps this counter (klippy/gcode.py,
+        # KalicoCrew/kalico); mainline and Snapmaker's Klipper have none.
+        interrupts = getattr(gcode, 'get_interrupt_counter', None)
+        counter = interrupts() if interrupts is not None else None
+        self._wait_cancelled = False
+        self._waiting_for = temp
+        try:
+            seq = self._intent_seq
+            eventtime = self.reactor.monotonic()
+            while not self.printer.is_shutdown() and not self._wait_cancelled:
+                if interrupts is not None and interrupts() != counter:
+                    return
+                chamber, target = heater.get_temp(eventtime)
+                if target <= 0. and self._m191_on_rejection == "continue":
+                    return
+                if self._intent_seq != seq:
+                    if target <= 0.:
+                        return
+                    seq = self._intent_seq
+                    self._waiting_for = temp = target
+                if target > 0. and not heater.check_busy(eventtime):
+                    return
+                # get_temp reads 0 for a stale sensor, so a dead reading
+                # never releases the wait.
+                if chamber >= temp:
+                    return
+                if get_temp is not None:
+                    gcode.respond_raw(get_temp(eventtime))
+                eventtime = self.reactor.pause(eventtime + 1.)
+        finally:
+            self._waiting_for = None
 
     def _set_heater(self, temp, wait, gcmd):
         pheaters = self.printer.lookup_object('heaters')
@@ -1101,10 +1167,18 @@ class DragonBreath:
         self._clear_heater_target_state()
         self.target = 0.
         self._external_off_lockout = True
-        message = (
-            "DragonBreath: chamber target %.0fC not applied (%s); "
-            "chamber target is now 0. Set it again to retry."
-            % (requested, reason))
+        if self._waiting_for is not None and self._m191_on_rejection == "wait":
+            message = (
+                "DragonBreath: the print is waiting for the chamber to reach "
+                "%.0fC, but the heater is off (%s). To continue, turn the "
+                "heater back on at the heater, use Try again in HelixScreen, "
+                "or press Cancel in your printer UI. Console commands can't "
+                "run while it waits." % (self._waiting_for, reason))
+        else:
+            message = (
+                "DragonBreath: chamber target %.0fC not applied (%s); "
+                "chamber target is now 0. Set it again to retry."
+                % (requested, reason))
         try:
             self.printer.lookup_object('gcode').respond_info(message)
         except Exception as exc:
@@ -1178,6 +1252,8 @@ class DragonBreath:
             "protocol_error_target": self.protocol_error_target,
             "protocol_error_seq": self.protocol_error_seq,
             "event_stream_live": bool(self._transport.event_stream_live()),
+            "wait_active": self._waiting_for is not None,
+            "wait_target": self._waiting_for,
         }
 
 

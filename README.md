@@ -60,6 +60,7 @@ host: 10.168.2.53          # DragonBreath device IP or hostname (dragonbreath.lo
                            # a control token on the device (NVS ctl_token); then match it.
 #poll_interval: 2.0        # API v2 polling fallback / retry base interval
 #register_macros: True     # register M141/M191 (set False if you define your own)
+#m191_on_rejection: wait   # wait | continue - M191 after a refused/overridden target
 
 [heater_generic dragonbreath]
 heater_pin: dragonbreath:pwm
@@ -118,7 +119,30 @@ or fan request:
 | `protocol_error_target` | the target (C) the rejected request asked for, or `null` |
 | `protocol_error_seq` | counts rejections since Klipper started; never resets |
 
-`M141` never raises on a rejection.
+Neither `M141` nor `M191` raises on a rejection. `M191` never treats a zeroed
+target as reached: it keeps waiting until the chamber reaches its `S` value,
+whatever heats it (a retry such as `dragonbreath/set_target`, or the heater
+turned back on at the box). It also stops waiting when a target of 0 is set, the
+print is cancelled (`pause_resume:cancel`, which Mainsail, Fluidd and HelixScreen
+Cancel send, or a Kalico `HEATER_INTERRUPT`), or Klipper shuts down. There is no
+timeout and no automatic pause. While it waits it holds the G-code lock, so
+console commands (including `CANCEL_PRINT` and `RESTART`) queue until it ends;
+the console warning says so and lists the ways out.
+
+`m191_on_rejection` chooses this behaviour:
+
+- `wait` (default): M191 holds the print as described above. The trade-off is
+  that it holds the G-code lock, so the only ways out are the chamber reaching
+  temperature, a Cancel from the printer UI (`printer.print.cancel`), an
+  emergency stop, or `dragonbreath/set_target`.
+- `continue`: M191 returns as soon as its target is zeroed, like Klipper's own
+  heater wait, and the print carries on with the chamber unheated. A slicer
+  `TEMPERATURE_WAIT` on the chamber sensor can then hang the print instead.
+
+While `M191` waits, the `dragonbreath` object reports `wait_active: true` and
+`wait_target` (the temperature it is holding for, following a newer target set
+during the wait); both reset when the wait ends, however it ends. Like stock
+`M109`/`M190`, the wait prints the heaters' temperature report line once a second.
 
 ### `dragonbreath/set_target` (Moonraker / API)
 Moonraker publishes the klippy endpoint as JSON-RPC
